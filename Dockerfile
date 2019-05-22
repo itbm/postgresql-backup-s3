@@ -2,6 +2,7 @@ FROM alpine:3.9
 LABEL maintainer="ITBM"
 
 RUN apk update \
+	&& apk add coreutils \
 	&& apk add postgresql-client \
 	&& apk add python py2-pip && pip install awscli && apk del py2-pip \
 	&& apk add openssl \
