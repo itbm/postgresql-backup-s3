@@ -1,6 +1,6 @@
 MIT License
 
-Copyright for portions of project mysql-backup-s3 are held by Johannes Schickling, 2017 as part of project Dockerfiles. All other copyright for project mysql-back-s3 are held by ITBM, 2019.
+Copyright for portions of project postgresql-backup-s3 are held by Johannes Schickling, 2017 as part of project Dockerfiles. All other copyright for project postgresql-back-s3 are held by ITBM, 2019.
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal
