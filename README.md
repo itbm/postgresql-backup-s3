@@ -64,22 +64,24 @@ spec:
 
 ## Environment variables
 
-- `POSTGRES_DATABASE` list of databases you want to backup (default: --all-databases)
-- `POSTGRES_HOST` the postgresql host *required*
-- `POSTGRES_PORT` the postgresql port (default: )
-- `POSTGRES_USER` the postgresql user *required*
-- `POSTGRES_PASSWORD` the postgresql password *required*
-- `POSTGRES_EXTRA_OPTS` extra postgresql options
-- `S3_ACCESS_KEY_ID` your AWS access key *required*
-- `S3_SECRET_ACCESS_KEY` your AWS secret key *required*
-- `S3_BUCKET` your AWS S3 bucket path *required*
-- `S3_PREFIX` path prefix in your bucket (default: 'backup')
-- `S3_REGION` the AWS S3 bucket region (default: us-west-1)
-- `S3_ENDPOINT` the AWS Endpoint URL, for S3 Compliant APIs such as [minio](https://minio.io) (default: none)
-- `S3_S3V4` set to `yes` to enable AWS Signature Version 4, required for [minio](https://minio.io) servers (default: no)
-- `SCHEDULE` backup schedule time, see explainatons below
-- `ENCRYPTION_PASSWORD` password to encrypt the backup. Can be decrypted using `openssl aes-256-cbc -d -in backup.sql.gz.enc -out backup.sql.gz`
-- `DELETE_OLDER_THAN` delete old backups, see explanation and warning below
+| Variable             | Default   | Required | Description                                                                                                              |
+|----------------------|-----------|----------|--------------------------------------------------------------------------------------------------------------------------|
+| POSTGRES_DATABASE    |           | Y        | Database you want to backup or 'all' to backup everything                                                                |
+| POSTGRES_HOST        |           | Y        | The PostgreSQL host                                                                                                      |
+| POSTGRES_PORT        | 5432      |          | The PostgreSQL port                                                                                                      |
+| POSTGRES_USER        |           | Y        | The PostgreSQL user                                                                                                      |
+| POSTGRES_PASSWORD    |           | Y        | The PostgreSQL password                                                                                                  |
+| POSTGRES_EXTRA_OPTS  |           |          | Extra postgresql options                                                                                                 |
+| S3_ACCESS_KEY_ID     |           | Y        | Your AWS access key                                                                                                      |
+| S3_SECRET_ACCESS_KEY |           | Y        | Your AWS secret key                                                                                                      |
+| S3_BUCKET            |           | Y        | Your AWS S3 bucket path                                                                                                  |
+| S3_PREFIX            | backup    |          | Path prefix in your bucket                                                                                               |
+| S3_REGION            | us-west-1 |          | The AWS S3 bucket region                                                                                                 |
+| S3_ENDPOINT          |           |          | The AWS Endpoint URL, for S3 Compliant APIs such as [minio](https://minio.io)                                            |
+| S3_S3V4              | no        |          | Set to `yes` to enable AWS Signature Version 4, required for [minio](https://minio.io) servers                           |
+| SCHEDULE             |           |          | Backup schedule time, see explainatons below                                                                             |
+| ENCRYPTION_PASSWORD  |           |          | Password to encrypt the backup. Can be decrypted using `openssl aes-256-cbc -d -in backup.sql.gz.enc -out backup.sql.gz` |
+| DELETE_OLDER_THAN    |           |          | Delete old backups, see explanation and warning below                                                                    |
 
 ### Automatic Periodic Backups
 
