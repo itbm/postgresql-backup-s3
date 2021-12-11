@@ -1,15 +1,17 @@
-FROM alpine:3.13
+
+FROM alpine:3.15 as base
+
+RUN apk add --no-cache curl \
+	&& curl -L --insecure https://github.com/odise/go-cron/releases/download/v0.0.6/go-cron-linux.gz | zcat > /usr/local/bin/go-cron && chmod u+x /usr/local/bin/go-cron
+
+FROM python:3.9-alpine3.15
 LABEL maintainer="ITBM"
 
-RUN apk update \
-	&& apk add coreutils \
-	&& apk add postgresql-client \
-	&& apk add python3 py3-pip && pip3 install --upgrade pip && pip3 install awscli \
-	&& apk add openssl \
-	&& apk add curl \
-	&& curl -L --insecure https://github.com/odise/go-cron/releases/download/v0.0.6/go-cron-linux.gz | zcat > /usr/local/bin/go-cron && chmod u+x /usr/local/bin/go-cron \
-	&& apk del curl \
-	&& rm -rf /var/cache/apk/*
+RUN apk add --no-cache postgresql14-client openssl \
+	&& pip3 --no-cache-dir install awscli \
+	&& rm -fr /root/.cache
+
+COPY --from=base --chmod=u+x /usr/local/bin/go-cron /usr/local/bin/go-cron
 
 ENV POSTGRES_DATABASE **None**
 ENV POSTGRES_HOST **None**
@@ -28,7 +30,6 @@ ENV SCHEDULE **None**
 ENV ENCRYPTION_PASSWORD **None**
 ENV DELETE_OLDER_THAN **None**
 
-ADD run.sh run.sh
-ADD backup.sh backup.sh
+ADD *.sh .
 
 CMD ["sh", "run.sh"]
