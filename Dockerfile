@@ -1,9 +1,9 @@
-FROM alpine:3.13
+FROM alpine:3.15
 LABEL maintainer="ITBM"
 
 RUN apk update \
 	&& apk add coreutils \
-	&& apk add postgresql-client \
+	&& apk add postgresql14-client \
 	&& apk add python3 py3-pip && pip3 install --upgrade pip && pip3 install awscli \
 	&& apk add openssl \
 	&& apk add curl \
