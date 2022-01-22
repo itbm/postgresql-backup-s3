@@ -29,6 +29,8 @@ ENV ENCRYPTION_PASSWORD **None**
 ENV DELETE_OLDER_THAN **None**
 
 ADD run.sh run.sh
+ADD common.sh common.sh
 ADD backup.sh backup.sh
+ADD restore.sh restore.sh
 
 CMD ["sh", "run.sh"]
