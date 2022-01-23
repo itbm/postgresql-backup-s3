@@ -98,3 +98,15 @@ WARNING: this will delete all files in the S3_PREFIX path, not just those create
 ### Encryption
 
 You can additionally set the `ENCRYPTION_PASSWORD` environment variable like `-e ENCRYPTION_PASSWORD="superstrongpassword"` to encrypt the backup. It can be decrypted using `openssl aes-256-cbc -d -in backup.sql.gz.enc -out backup.sql.gz`.
+
+
+### Restoring data from backup
+
+If you need to restore data, start the backup container, find the container name
+or ID, then run:
+
+```
+docker exec -it ${CONTAINER} /bin/sh /restore.sh
+```
+
+The latest backup will be found and restored.
