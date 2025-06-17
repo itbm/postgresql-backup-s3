@@ -66,6 +66,9 @@ if [ "$USE_CUSTOM_FORMAT" = "yes" ]; then
   if [ "${POSTGRES_DATABASE}" == "all" ]; then
     echo "ERROR: Custom format (-Fc) is not supported with pg_dumpall."
     exit 1
+  elif [ -n "$TABLES" ]; then
+    echo "Dumping specific tables in custom format: $TABLES"
+    pg_dump -Fc $POSTGRES_HOST_OPTS -d "$POSTGRES_DATABASE" $(for table in $TABLES; do echo -n "-t $table "; done) > "$SRC_FILE"
   else
     pg_dump -Fc $POSTGRES_HOST_OPTS $POSTGRES_DATABASE > $SRC_FILE
   fi

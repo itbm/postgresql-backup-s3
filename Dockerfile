@@ -8,12 +8,12 @@ RUN apk update \
 
 COPY main.go /app/main.go
 
-RUN go mod init github.com/itbm/postgresql-backup-s3 \
+RUN go mod init github.com/guy1998/postgresql-backup-s3 \
 	&& go get github.com/robfig/cron/v3 \
 	&& go build -o out/go-cron
 
 FROM alpine:3.22
-LABEL maintainer="ITBM"
+LABEL maintainer="guy1998"
 
 RUN apk update \
 	&& apk upgrade \
@@ -45,6 +45,7 @@ ENV USE_CUSTOM_FORMAT no
 ENV COMPRESSION_CMD 'gzip'
 ENV DECOMPRESSION_CMD 'gunzip -c'
 ENV PARALLEL_JOBS 1
+ENV TABLES **None**
 
 ADD run.sh run.sh
 ADD backup.sh backup.sh
