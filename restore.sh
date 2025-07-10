@@ -94,7 +94,7 @@ if [[ "$LOCAL_FILE" == *.enc ]]; then
   
   echo "Decrypting backup file"
   DECRYPTED_PATH="${DOWNLOAD_PATH%.enc}"
-  openssl enc -aes-256-cbc -d -in $DOWNLOAD_PATH -out $DECRYPTED_PATH -k $ENCRYPTION_PASSWORD
+  openssl enc -aes-256-cbc -d -pbkdf2 -in "$DOWNLOAD_PATH" -out "$DECRYPTED_PATH" -k "$ENCRYPTION_PASSWORD"
   if [ $? != 0 ]; then
     echo "Error decrypting backup file. Check your encryption password."
     exit 1
