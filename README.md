@@ -7,46 +7,122 @@ Backup and restore PostgreSQL to/from S3 (supports periodic backups and encrypti
 ### Backup
 
 ```sh
-$ docker run -e S3_ACCESS_KEY_ID=key -e S3_SECRET_ACCESS_KEY=secret -e S3_BUCKET=my-bucket -e S3_PREFIX=backup -e POSTGRES_DATABASE=dbname -e POSTGRES_USER=user -e POSTGRES_PASSWORD=password -e POSTGRES_HOST=localhost itbm/postgres-backup-s3
+$ docker run -e S3_ACCESS_KEY_ID=key -e S3_SECRET_ACCESS_KEY=secret -e S3_BUCKET=my-bucket -e S3_PREFIX=backup -e POSTGRES_DATABASE=dbname -e POSTGRES_USER=user -e POSTGRES_PASSWORD=password -e POSTGRES_HOST=localhost ghcr.io/techcrazi/postgresql-backup-s3:latest /bin/sh /usr/local/bin/backup.sh
 ```
 
 ### Restore
 
 ```sh
-$ docker run -e S3_ACCESS_KEY_ID=key -e S3_SECRET_ACCESS_KEY=secret -e S3_BUCKET=my-bucket -e BACKUP_FILE=backup/dbname_0000-00-00T00:00:00Z.sql.gz -e POSTGRES_DATABASE=dbname -e POSTGRES_USER=user -e POSTGRES_PASSWORD=password -e POSTGRES_HOST=localhost -e CREATE_DATABASE=yes itbm/postgres-backup-s3
+$ docker run -e S3_ACCESS_KEY_ID=key -e S3_SECRET_ACCESS_KEY=secret -e S3_BUCKET=my-bucket -e BACKUP_FILE=backup/dbname_0000-00-00T00:00:00Z.sql.gz -e POSTGRES_DATABASE=dbname -e POSTGRES_USER=user -e POSTGRES_PASSWORD=password -e POSTGRES_HOST=localhost -e CREATE_DATABASE=yes ghcr.io/techcrazi/postgresql-backup-s3:latest /bin/sh /usr/local/bin/restore.sh
 ```
 
 Note: When `BACKUP_FILE` is provided, the container automatically runs the restore process instead of backup.
 
-## Kubernetes Deployment
+## Kubernetes CronJob - Backup
 
 ```
 apiVersion: v1
 kind: Namespace
 metadata:
-  name: backup
+  name: postgres
 
 ---
-apiVersion: apps/v1
-kind: Deployment
+apiVersion: batch/v1
+kind: CronJob
 metadata:
-  name: postgresql
-  namespace: backup
+  name: postgresql-backup
+  labels:
+    app: postgresql-backup
+  namespace: postgres
 spec:
-  selector:
-    matchLabels:
-      app: postgresql
-  strategy:
-    type: Recreate
-  template:
-    metadata:
-      labels:
-        app: postgresql
+  schedule: "0 * * * *"  # Every hour
+  successfulJobsHistoryLimit: 2
+  failedJobsHistoryLimit: 2
+  jobTemplate:
     spec:
+      backoffLimit: 1
+      template:
+        metadata:
+          labels:
+            app: postgresql-backup
+        spec:
+          securityContext:
+            seccompProfile:
+              type: RuntimeDefault
+          restartPolicy: Never
+          containers:
+          - name: postgresql-backup
+            image: ghcr.io/techcrazi/postgresql-backup-s3:latest
+            imagePullPolicy: Always
+            command: ["/bin/sh", "/usr/local/bin/backup.sh"]
+            workingDir: /backup
+            securityContext:
+              allowPrivilegeEscalation: false
+              capabilities:
+                drop: ["ALL"]
+              runAsNonRoot: true
+              runAsUser: 70
+              seccompProfile:
+                type: RuntimeDefault
+            volumeMounts:
+            - name: backup-tmp
+              mountPath: /backup
+        env:
+        - name: POSTGRES_DATABASE
+          value: ""
+        - name: POSTGRES_HOST
+          value: ""
+        - name: POSTGRES_PORT
+          value: ""
+        - name: POSTGRES_PASSWORD
+          value: ""
+        - name: POSTGRES_USER
+          value: ""
+        - name: S3_ACCESS_KEY_ID
+          value: ""
+        - name: S3_SECRET_ACCESS_KEY
+          value: ""
+        - name: S3_BUCKET
+          value: ""
+        - name: S3_ENDPOINT
+          value: "https://s3"
+        - name: S3_REGION
+          value: ""
+        - name: S3_S3V4
+          value: "yes"
+        - name: S3_PREFIX
+          value: ""
+        - name: DELETE_OLDER_THAN
+          value: "15 days ago"   
+      volumes:
+       - name: backup-tmp
+         emptyDir: {}
+```
+
+## Kubernetes Job - Restore
+
+```
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: postgres
+
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: pg-restore-oneshot
+  namespace: postgres
+spec:
+  backoffLimit: 0
+  ttlSecondsAfterFinished: 300 # 5 min run time to keep the job around
+  template:
+    spec:
+      restartPolicy: Never
       containers:
-      - name: postgresql
-        image: itbm/postgresql-backup-s3
-        imagePullPolicy: Always
+        - name: backup
+          image: ghcr.io/techcrazi/postgresql-backup-s3:latest
+          command: ["/usr/local/bin/restore.sh"]
         env:
         - name: POSTGRES_DATABASE
           value: ""
@@ -68,9 +144,11 @@ spec:
           value: ""
         - name: S3_PREFIX
           value: ""
-        - name: SCHEDULE
-          value: ""
+        - name: BACKUP_FILE
+          value: "BucketName/BackupFileName.gz"
 ```
+
+
 
 ## Environment variables
 
@@ -135,17 +213,17 @@ There are two options for backup format:
 For plain text format, backups are compressed with `gzip` by default. For improved performance on multi-core systems, you can use `pigz` (parallel gzip) instead:
 
 ```sh
-$ docker run ... -e COMPRESSION_CMD=pigz ... itbm/postgres-backup-s3
+$ docker run ... -e COMPRESSION_CMD=pigz ... ghcr.io/techcrazi/postgresql-backup-s3:latest
 
-$ docker run ... -e DECOMPRESSION_CMD="pigz -dc" ... itbm/postgres-backup-s3
+$ docker run ... -e DECOMPRESSION_CMD="pigz -dc" ... ghcr.io/techcrazi/postgresql-backup-s3:latest
 ```
 
 When using custom format with parallel restore:
 
 ```sh
-$ docker run ... -e USE_CUSTOM_FORMAT=yes ... itbm/postgres-backup-s3
+$ docker run ... -e USE_CUSTOM_FORMAT=yes ... ghcr.io/techcrazi/postgresql-backup-s3:latest
 
-$ docker run ... -e PARALLEL_JOBS=4 -e BACKUP_FILE=backup/dbname_0000-00-00T00:00:00Z.dump ... itbm/postgres-backup-s3
+$ docker run ... -e PARALLEL_JOBS=4 -e BACKUP_FILE=backup/dbname_0000-00-00T00:00:00Z.dump ... ghcr.io/techcrazi/postgresql-backup-s3:latest
 ```
 
 Note: Custom format is not available when using `POSTGRES_DATABASE=all` as pg_dumpall does not support this format.
