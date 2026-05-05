@@ -82,6 +82,7 @@ spec:
 | POSTGRES_USER        |           | Y        | The PostgreSQL user                                                                                                      |
 | POSTGRES_PASSWORD    |           | Y        | The PostgreSQL password                                                                                                  |
 | POSTGRES_EXTRA_OPTS  |           |          | Extra postgresql options                                                                                                 |
+| POSTGRES_EXTRA_DUMP_OPTS |       |          | Extra options passed to `pg_dump`/`pg_dumpall` (e.g. `--exclude-table=public.foo`)                                       |
 | S3_ACCESS_KEY_ID     |           | Y        | Your AWS access key                                                                                                      |
 | S3_SECRET_ACCESS_KEY |           | Y        | Your AWS secret key                                                                                                      |
 | S3_BUCKET            |           | Y        | Your AWS S3 bucket path                                                                                                  |
