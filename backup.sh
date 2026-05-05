@@ -67,15 +67,15 @@ if [ "$USE_CUSTOM_FORMAT" = "yes" ]; then
     echo "ERROR: Custom format (-Fc) is not supported with pg_dumpall."
     exit 1
   else
-    pg_dump -Fc $POSTGRES_HOST_OPTS $POSTGRES_DATABASE > $SRC_FILE
+    pg_dump -Fc $POSTGRES_HOST_OPTS $POSTGRES_EXTRA_DUMP_OPTS $POSTGRES_DATABASE > $SRC_FILE
   fi
 else
   SRC_FILE=dump.sql.gz
   DEST_FILE=${POSTGRES_DATABASE}_$(date +"%Y-%m-%dT%H:%M:%SZ").sql.gz
   if [ "${POSTGRES_DATABASE}" == "all" ]; then
-    pg_dumpall $POSTGRES_HOST_OPTS | $COMPRESSION_CMD > $SRC_FILE
+    pg_dumpall $POSTGRES_HOST_OPTS $POSTGRES_EXTRA_DUMP_OPTS | $COMPRESSION_CMD > $SRC_FILE
   else
-    pg_dump $POSTGRES_HOST_OPTS $POSTGRES_DATABASE | $COMPRESSION_CMD > $SRC_FILE
+    pg_dump $POSTGRES_HOST_OPTS $POSTGRES_EXTRA_DUMP_OPTS $POSTGRES_DATABASE | $COMPRESSION_CMD > $SRC_FILE
   fi
 fi
 
