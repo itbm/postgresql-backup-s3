@@ -61,8 +61,10 @@ POSTGRES_HOST_OPTS="-h $POSTGRES_HOST -p $POSTGRES_PORT -U $POSTGRES_USER $POSTG
 echo "Creating dump of ${POSTGRES_DATABASE} database from ${POSTGRES_HOST}..."
 
 if [ "$USE_CUSTOM_FORMAT" = "yes" ]; then
-  SRC_FILE=dump.dump
+  SRC_FILE=/tmp/dump.dump
   DEST_FILE=${POSTGRES_DATABASE}_$(date +"%Y-%m-%dT%H:%M:%SZ").dump
+  rm -f $SRC_FILE
+
   if [ "${POSTGRES_DATABASE}" == "all" ]; then
     echo "ERROR: Custom format (-Fc) is not supported with pg_dumpall."
     exit 1
@@ -70,8 +72,10 @@ if [ "$USE_CUSTOM_FORMAT" = "yes" ]; then
     pg_dump -Fc $POSTGRES_HOST_OPTS $POSTGRES_DATABASE > $SRC_FILE
   fi
 else
-  SRC_FILE=dump.sql.gz
+  SRC_FILE=/tmp/dump.sql.gz
   DEST_FILE=${POSTGRES_DATABASE}_$(date +"%Y-%m-%dT%H:%M:%SZ").sql.gz
+  rm -f $SRC_FILE
+  
   if [ "${POSTGRES_DATABASE}" == "all" ]; then
     pg_dumpall $POSTGRES_HOST_OPTS | $COMPRESSION_CMD > $SRC_FILE
   else
@@ -94,6 +98,7 @@ fi
 echo "Uploading dump to $S3_BUCKET"
 
 cat $SRC_FILE | aws $AWS_ARGS s3 cp - s3://$S3_BUCKET/$S3_PREFIX/$DEST_FILE || exit 2
+rm -f $SRC_FILE
 
 if [ "${DELETE_OLDER_THAN}" != "**None**" ]; then
   >&2 echo "Checking for files older than ${DELETE_OLDER_THAN}"
