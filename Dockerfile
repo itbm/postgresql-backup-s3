@@ -8,7 +8,7 @@ RUN apk update \
 
 COPY main.go /app/main.go
 
-RUN go mod init github.com/itbm/postgresql-backup-s3 \
+RUN go mod init github.com/LWJerri/postgresql-backup-s3 \
 	&& go get github.com/robfig/cron/v3 \
 	&& go build -o out/go-cron
 

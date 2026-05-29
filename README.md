@@ -7,13 +7,13 @@ Backup and restore PostgreSQL to/from S3 (supports periodic backups and encrypti
 ### Backup
 
 ```sh
-$ docker run -e S3_ACCESS_KEY_ID=key -e S3_SECRET_ACCESS_KEY=secret -e S3_BUCKET=my-bucket -e S3_PREFIX=backup -e POSTGRES_DATABASE=dbname -e POSTGRES_USER=user -e POSTGRES_PASSWORD=password -e POSTGRES_HOST=localhost itbm/postgres-backup-s3
+$ docker run -e S3_ACCESS_KEY_ID=key -e S3_SECRET_ACCESS_KEY=secret -e S3_BUCKET=my-bucket -e S3_PREFIX=backup -e POSTGRES_DATABASE=dbname -e POSTGRES_USER=user -e POSTGRES_PASSWORD=password -e POSTGRES_HOST=localhost lwjerri/postgres-backup-s3
 ```
 
 ### Restore
 
 ```sh
-$ docker run -e S3_ACCESS_KEY_ID=key -e S3_SECRET_ACCESS_KEY=secret -e S3_BUCKET=my-bucket -e BACKUP_FILE=backup/dbname_0000-00-00T00:00:00Z.sql.gz -e POSTGRES_DATABASE=dbname -e POSTGRES_USER=user -e POSTGRES_PASSWORD=password -e POSTGRES_HOST=localhost -e CREATE_DATABASE=yes itbm/postgres-backup-s3
+$ docker run -e S3_ACCESS_KEY_ID=key -e S3_SECRET_ACCESS_KEY=secret -e S3_BUCKET=my-bucket -e BACKUP_FILE=backup/dbname_0000-00-00T00:00:00Z.sql.gz -e POSTGRES_DATABASE=dbname -e POSTGRES_USER=user -e POSTGRES_PASSWORD=password -e POSTGRES_HOST=localhost -e CREATE_DATABASE=yes lwjerri/postgres-backup-s3
 ```
 
 Note: When `BACKUP_FILE` is provided, the container automatically runs the restore process instead of backup.
@@ -45,7 +45,7 @@ spec:
     spec:
       containers:
       - name: postgresql
-        image: itbm/postgresql-backup-s3
+        image: lwjerri/postgresql-backup-s3
         imagePullPolicy: Always
         env:
         - name: POSTGRES_DATABASE
@@ -136,17 +136,17 @@ There are two options for backup format:
 For plain text format, backups are compressed with `gzip` by default. For improved performance on multi-core systems, you can use `pigz` (parallel gzip) instead:
 
 ```sh
-$ docker run ... -e COMPRESSION_CMD=pigz ... itbm/postgres-backup-s3
+$ docker run ... -e COMPRESSION_CMD=pigz ... lwjerri/postgres-backup-s3
 
-$ docker run ... -e DECOMPRESSION_CMD="pigz -dc" ... itbm/postgres-backup-s3
+$ docker run ... -e DECOMPRESSION_CMD="pigz -dc" ... lwjerri/postgres-backup-s3
 ```
 
 When using custom format with parallel restore:
 
 ```sh
-$ docker run ... -e USE_CUSTOM_FORMAT=yes ... itbm/postgres-backup-s3
+$ docker run ... -e USE_CUSTOM_FORMAT=yes ... lwjerri/postgres-backup-s3
 
-$ docker run ... -e PARALLEL_JOBS=4 -e BACKUP_FILE=backup/dbname_0000-00-00T00:00:00Z.dump ... itbm/postgres-backup-s3
+$ docker run ... -e PARALLEL_JOBS=4 -e BACKUP_FILE=backup/dbname_0000-00-00T00:00:00Z.dump ... lwjerri/postgres-backup-s3
 ```
 
 Note: Custom format is not available when using `POSTGRES_DATABASE=all` as pg_dumpall does not support this format.
