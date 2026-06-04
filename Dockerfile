@@ -17,7 +17,7 @@ LABEL maintainer="ITBM"
 
 RUN apk update \
 	&& apk upgrade \
-	&& apk add coreutils postgresql17-client aws-cli openssl pigz \
+	&& apk add coreutils postgresql17-client aws-cli openssl pigz ca-certificates \
 	&& rm -rf /var/cache/apk/*
 
 COPY --from=build /app/out/go-cron /usr/local/bin/go-cron

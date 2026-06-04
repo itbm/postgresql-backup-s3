@@ -88,6 +88,7 @@ spec:
 | S3_PREFIX            | backup    |          | Path prefix in your bucket                                                                                               |
 | S3_REGION            | us-west-1 |          | The AWS S3 bucket region                                                                                                 |
 | S3_ENDPOINT          |           |          | The AWS Endpoint URL, for S3 Compliant APIs such as [minio](https://minio.io)                                            |
+| S3_SSL_VERIFY          |           |          | Check S3 endpoint ssl                                            |
 | S3_S3V4              | no        |          | Set to `yes` to enable AWS Signature Version 4, required for [minio](https://minio.io) servers                           |
 | SCHEDULE             |           |          | Backup schedule time, see explainatons below                                                                             |
 | ENCRYPTION_PASSWORD  |           |          | Password to encrypt/decrypt the backup                                                                                   |

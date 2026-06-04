@@ -48,7 +48,10 @@ fi
 if [ "${S3_ENDPOINT}" == "**None**" ]; then
   AWS_ARGS=""
 else
-  AWS_ARGS="--endpoint-url ${S3_ENDPOINT}"
+  if [ "${S3_SSL_VERIFY}" == "false" ]; then
+    AWS_ARGS="--endpoint-url --no-verify-ssl ${S3_ENDPOINT}"
+  else
+    AWS_ARGS="--endpoint-url ${S3_ENDPOINT}"
 fi
 
 export AWS_ACCESS_KEY_ID=$S3_ACCESS_KEY_ID
