@@ -17,7 +17,7 @@ LABEL maintainer="ITBM"
 
 RUN apk update \
 	&& apk upgrade \
-	&& apk add coreutils postgresql17-client aws-cli openssl pigz \
+	&& apk add coreutils postgresql17-client aws-cli openssl pigz ca-certificates \
 	&& rm -rf /var/cache/apk/*
 
 COPY --from=build /app/out/go-cron /usr/local/bin/go-cron
@@ -34,6 +34,7 @@ ENV S3_BUCKET **None**
 ENV S3_REGION us-west-1
 ENV S3_PREFIX 'backup'
 ENV S3_ENDPOINT **None**
+ENV S3_SSL_VERIFY true
 ENV S3_S3V4 no
 ENV SCHEDULE **None**
 ENV ENCRYPTION_PASSWORD **None**
