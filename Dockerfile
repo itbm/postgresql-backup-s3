@@ -1,4 +1,4 @@
-FROM alpine:3.22 AS build
+FROM alpine:3.23 AS build
 
 WORKDIR /app
 
@@ -12,12 +12,12 @@ RUN go mod init github.com/itbm/postgresql-backup-s3 \
 	&& go get github.com/robfig/cron/v3 \
 	&& go build -o out/go-cron
 
-FROM alpine:3.22
+FROM alpine:3.23
 LABEL maintainer="ITBM"
 
 RUN apk update \
 	&& apk upgrade \
-	&& apk add coreutils postgresql17-client aws-cli openssl pigz \
+	&& apk add coreutils postgresql18-client aws-cli openssl pigz \
 	&& rm -rf /var/cache/apk/*
 
 COPY --from=build /app/out/go-cron /usr/local/bin/go-cron
