@@ -5,18 +5,20 @@ set -o pipefail
 
 >&2 echo "-----"
 
+quote_ident() {
+  printf '"%s"' "$(printf '%s' "$1" | sed 's/"/""/g')"
+}
+
 cleanup() {
+  echo "Cleaning up temporary files"
+  if [ -n "$ENCRYPTED_PATH" ]; then
+    rm -f "$ENCRYPTED_PATH"
+  fi
+  if [ -n "$DECRYPTED_PATH" ]; then
+    rm -f "$DECRYPTED_PATH"
+  fi
   if [ -n "$DOWNLOAD_PATH" ]; then
-    echo "Cleaning up temporary files"
-    if [[ "$DOWNLOAD_PATH" == *.enc ]]; then
-      rm -f "$DOWNLOAD_PATH"
-      rm -f "${DOWNLOAD_PATH%.enc}"
-    elif [[ "$DOWNLOAD_PATH" == *.sql.gz ]]; then
-      rm -f "$DOWNLOAD_PATH"
-      rm -f "${DOWNLOAD_PATH}.enc"
-    else
-      rm -f "$DOWNLOAD_PATH"
-    fi
+    rm -f "$DOWNLOAD_PATH"
   fi
 }
 trap cleanup EXIT
@@ -61,7 +63,7 @@ if [ "${POSTGRES_PASSWORD}" = "**None**" ]; then
   exit 1
 fi
 
-if [ "${S3_ENDPOINT}" == "**None**" ]; then
+if [ "${S3_ENDPOINT}" = "**None**" ]; then
   AWS_ARGS=""
 else
   AWS_ARGS="--endpoint-url ${S3_ENDPOINT}"
@@ -73,84 +75,102 @@ if [ "${BACKUP_FILE}" = "**None**" ]; then
   exit 1
 fi
 
+# Avoid AWS CLI v2 default checksum behaviour that breaks many S3-compatible
+# endpoints and some streaming uploads (XAmzContentSHA256Mismatch).
+export AWS_REQUEST_CHECKSUM_CALCULATION="${AWS_REQUEST_CHECKSUM_CALCULATION:-when_required}"
+export AWS_RESPONSE_CHECKSUM_VALIDATION="${AWS_RESPONSE_CHECKSUM_VALIDATION:-when_required}"
+
 export AWS_ACCESS_KEY_ID=$S3_ACCESS_KEY_ID
 export AWS_SECRET_ACCESS_KEY=$S3_SECRET_ACCESS_KEY
 export AWS_DEFAULT_REGION=$S3_REGION
 
 export PGPASSWORD=$POSTGRES_PASSWORD
 POSTGRES_HOST_OPTS="-h $POSTGRES_HOST -p $POSTGRES_PORT -U $POSTGRES_USER $POSTGRES_EXTRA_OPTS"
+POSTGRES_DATABASE_IDENT=$(quote_ident "$POSTGRES_DATABASE")
 
-LOCAL_FILE=$(basename $BACKUP_FILE)
+LOCAL_FILE=$(basename "$BACKUP_FILE")
 DOWNLOAD_PATH="/tmp/$LOCAL_FILE"
+ENCRYPTED_PATH=""
+DECRYPTED_PATH=""
 
-echo "Downloading backup file from S3: s3://$S3_BUCKET/$BACKUP_FILE"
-aws $AWS_ARGS s3 cp s3://$S3_BUCKET/$BACKUP_FILE $DOWNLOAD_PATH || exit 2
+echo "Downloading backup file from S3: s3://${S3_BUCKET}/${BACKUP_FILE}"
+aws $AWS_ARGS s3 cp "s3://${S3_BUCKET}/${BACKUP_FILE}" "$DOWNLOAD_PATH" || exit 2
 
-if [[ "$LOCAL_FILE" == *.enc ]]; then
-  if [ "${ENCRYPTION_PASSWORD}" = "**None**" ]; then
-    echo "Backup file is encrypted. You need to set the ENCRYPTION_PASSWORD environment variable."
-    exit 1
-  fi
-  
-  echo "Decrypting backup file"
-  DECRYPTED_PATH="${DOWNLOAD_PATH%.enc}"
-  openssl enc -aes-256-cbc -d -in $DOWNLOAD_PATH -out $DECRYPTED_PATH -k $ENCRYPTION_PASSWORD
-  if [ $? != 0 ]; then
-    echo "Error decrypting backup file. Check your encryption password."
-    exit 1
-  fi
-  DOWNLOAD_PATH=$DECRYPTED_PATH
-fi
+case "$LOCAL_FILE" in
+  *.enc)
+    if [ "${ENCRYPTION_PASSWORD}" = "**None**" ]; then
+      echo "Backup file is encrypted. You need to set the ENCRYPTION_PASSWORD environment variable."
+      exit 1
+    fi
+
+    echo "Decrypting backup file"
+    ENCRYPTED_PATH="$DOWNLOAD_PATH"
+    DECRYPTED_PATH="${DOWNLOAD_PATH%.enc}"
+    # Prefer PBKDF2 (current format); fall back to legacy OpenSSL key derivation.
+    if ! openssl enc -aes-256-cbc -d -pbkdf2 -iter 100000 -in "$ENCRYPTED_PATH" -out "$DECRYPTED_PATH" -pass "pass:${ENCRYPTION_PASSWORD}" 2>/dev/null; then
+      if ! openssl enc -aes-256-cbc -d -in "$ENCRYPTED_PATH" -out "$DECRYPTED_PATH" -pass "pass:${ENCRYPTION_PASSWORD}"; then
+        echo "Error decrypting backup file. Check your encryption password."
+        exit 1
+      fi
+      echo "WARNING: Decrypted legacy OpenSSL backup (non-PBKDF2). Re-backup to upgrade encryption."
+    fi
+    DOWNLOAD_PATH=$DECRYPTED_PATH
+    ;;
+esac
 
 echo "Restoring database ${POSTGRES_DATABASE} on ${POSTGRES_HOST}"
 
 if [ "${DROP_DATABASE}" = "yes" ]; then
-  if [ "${POSTGRES_DATABASE}" == "all" ]; then
+  if [ "${POSTGRES_DATABASE}" = "all" ]; then
     echo "Cannot drop all databases. Please specify a single database to drop."
     exit 1
   fi
   echo "Dropping database ${POSTGRES_DATABASE}"
-  if ! psql $POSTGRES_HOST_OPTS -d postgres -c "DROP DATABASE IF EXISTS ${POSTGRES_DATABASE} WITH (FORCE);" > /dev/null 2>&1; then
+  if ! psql $POSTGRES_HOST_OPTS -d postgres -c "DROP DATABASE IF EXISTS ${POSTGRES_DATABASE_IDENT} WITH (FORCE);" > /dev/null 2>&1; then
     echo "WARNING: Failed to drop database ${POSTGRES_DATABASE}. It might not exist."
   fi
 fi
 
 if [ "${CREATE_DATABASE}" = "yes" ]; then
-  if [ "${POSTGRES_DATABASE}" == "all" ]; then
+  if [ "${POSTGRES_DATABASE}" = "all" ]; then
     echo "Cannot create all databases. Please specify a single database to create."
     exit 1
   fi
   echo "Creating database ${POSTGRES_DATABASE}"
-  if ! psql $POSTGRES_HOST_OPTS -d postgres -c "CREATE DATABASE ${POSTGRES_DATABASE};" > /dev/null 2>&1; then
+  if ! psql $POSTGRES_HOST_OPTS -d postgres -c "CREATE DATABASE ${POSTGRES_DATABASE_IDENT};" > /dev/null 2>&1; then
     echo "WARNING: Failed to create database ${POSTGRES_DATABASE}. It might already exist."
   fi
 fi
 
-if [[ "$DOWNLOAD_PATH" == *.sql.gz ]]; then
-  if [ "${POSTGRES_DATABASE}" == "all" ]; then
-    echo "Restoring all databases"
-    $DECOMPRESSION_CMD $DOWNLOAD_PATH | psql $POSTGRES_HOST_OPTS -d postgres
-  else
-    echo "Restoring database ${POSTGRES_DATABASE}"
-    $DECOMPRESSION_CMD $DOWNLOAD_PATH | psql $POSTGRES_HOST_OPTS -d $POSTGRES_DATABASE
-  fi
-elif [[ "$DOWNLOAD_PATH" == *.dump ]]; then
-  if [ "${POSTGRES_DATABASE}" == "all" ]; then
-    echo "ERROR: Custom format backup cannot be used to restore all databases."
-    exit 1
-  else
-    echo "Restoring database ${POSTGRES_DATABASE} from custom format"
-    if [ "$PARALLEL_JOBS" -gt 1 ]; then
-      echo "Using parallel restore with $PARALLEL_JOBS jobs"
-      pg_restore -j $PARALLEL_JOBS $POSTGRES_HOST_OPTS -d $POSTGRES_DATABASE $DOWNLOAD_PATH
+case "$DOWNLOAD_PATH" in
+  *.sql.gz)
+    if [ "${POSTGRES_DATABASE}" = "all" ]; then
+      echo "Restoring all databases"
+      $DECOMPRESSION_CMD "$DOWNLOAD_PATH" | psql $POSTGRES_HOST_OPTS -d postgres
     else
-      pg_restore $POSTGRES_HOST_OPTS -d $POSTGRES_DATABASE $DOWNLOAD_PATH
+      echo "Restoring database ${POSTGRES_DATABASE}"
+      $DECOMPRESSION_CMD "$DOWNLOAD_PATH" | psql $POSTGRES_HOST_OPTS -d "$POSTGRES_DATABASE"
     fi
-  fi
-else
-  echo "ERROR: Unsupported backup format. Expected *.sql.gz or *.dump file."
-  exit 1
-fi
+    ;;
+  *.dump)
+    if [ "${POSTGRES_DATABASE}" = "all" ]; then
+      echo "ERROR: Custom format backup cannot be used to restore all databases."
+      exit 1
+    else
+      echo "Restoring database ${POSTGRES_DATABASE} from custom format"
+      if [ "$PARALLEL_JOBS" -gt 1 ]; then
+        echo "Using parallel restore with $PARALLEL_JOBS jobs"
+        pg_restore -j "$PARALLEL_JOBS" $POSTGRES_HOST_OPTS -d "$POSTGRES_DATABASE" "$DOWNLOAD_PATH"
+      else
+        pg_restore $POSTGRES_HOST_OPTS -d "$POSTGRES_DATABASE" "$DOWNLOAD_PATH"
+      fi
+    fi
+    ;;
+  *)
+    echo "ERROR: Unsupported backup format. Expected *.sql.gz or *.dump file."
+    exit 1
+    ;;
+esac
 
 echo "Database restore completed successfully"
 

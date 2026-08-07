@@ -81,7 +81,8 @@ spec:
 | POSTGRES_PORT        | 5432      |          | The PostgreSQL port                                                                                                      |
 | POSTGRES_USER        |           | Y        | The PostgreSQL user                                                                                                      |
 | POSTGRES_PASSWORD    |           | Y        | The PostgreSQL password                                                                                                  |
-| POSTGRES_EXTRA_OPTS  |           |          | Extra postgresql options                                                                                                 |
+| POSTGRES_EXTRA_OPTS  |           |          | Extra options passed to all PostgreSQL client commands (`pg_dump`, `psql`, `pg_restore`, etc.)                           |
+| POSTGRES_EXTRA_DUMP_OPTS |       |          | Extra options passed only to `pg_dump`/`pg_dumpall` (e.g. `--exclude-table=public.foo`)                                  |
 | S3_ACCESS_KEY_ID     |           | Y        | Your AWS access key                                                                                                      |
 | S3_SECRET_ACCESS_KEY |           | Y        | Your AWS secret key                                                                                                      |
 | S3_BUCKET            |           | Y        | Your AWS S3 bucket path                                                                                                  |
@@ -90,6 +91,7 @@ spec:
 | S3_ENDPOINT          |           |          | The AWS Endpoint URL, for S3 Compliant APIs such as [minio](https://minio.io)                                            |
 | S3_S3V4              | no        |          | Set to `yes` to enable AWS Signature Version 4, required for [minio](https://minio.io) servers                           |
 | SCHEDULE             |           |          | Backup schedule time, see explainatons below                                                                             |
+| COMMAND_TIMEOUT      |           |          | Max duration for a scheduled backup (`go` duration, e.g. `2h`). Empty/`0` disables the timeout (default)                 |
 | ENCRYPTION_PASSWORD  |           |          | Password to encrypt/decrypt the backup                                                                                   |
 | DELETE_OLDER_THAN    |           |          | Delete old backups, see explanation and warning below                                                                    |
 | USE_CUSTOM_FORMAT    | no        |          | Use PostgreSQL's custom format (-Fc) instead of plain text with compression                                              |
@@ -104,6 +106,8 @@ spec:
 
 You can additionally set the `SCHEDULE` environment variable like `-e SCHEDULE="@daily"` to run the backup automatically.
 
+If a run is still in progress when the next schedule fires, the overlapping run is skipped. Optionally set `COMMAND_TIMEOUT` (for example `-e COMMAND_TIMEOUT=2h`) to limit how long a single scheduled backup may run; by default there is no timeout.
+
 More information about the scheduling can be found [here](http://godoc.org/github.com/robfig/cron#hdr-Predefined_schedules).
 
 ### Delete Old Backups
@@ -114,7 +118,7 @@ WARNING: this will delete all files in the S3_PREFIX path, not just those create
 
 ### Encryption
 
-You can additionally set the `ENCRYPTION_PASSWORD` environment variable like `-e ENCRYPTION_PASSWORD="superstrongpassword"` to encrypt the backup. The restore process will automatically detect encrypted backups and decrypt them when the `ENCRYPTION_PASSWORD` environment variable is set correctly. It can be manually decrypted using `openssl aes-256-cbc -d -in backup.sql.gz.enc -out backup.sql.gz`.
+You can additionally set the `ENCRYPTION_PASSWORD` environment variable like `-e ENCRYPTION_PASSWORD="superstrongpassword"` to encrypt the backup. New backups use AES-256-CBC with PBKDF2 (100000 iterations). The restore process detects encrypted backups and decrypts them when `ENCRYPTION_PASSWORD` is set; legacy (pre-PBKDF2) backups are still accepted with a warning. Manual decrypt for current backups: `openssl enc -aes-256-cbc -d -pbkdf2 -iter 100000 -in backup.sql.gz.enc -out backup.sql.gz`.
 
 ### Backup Format and Compression Options
 
