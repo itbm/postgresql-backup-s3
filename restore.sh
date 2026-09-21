@@ -13,6 +13,8 @@ has_value() {
   [ -n "$1" ] && [ "$1" != "**None**" ]
 }
 
+. "$(dirname "$0")/hooks.sh"
+
 cleanup() {
   if [ -n "$ENCRYPTED_PATH" ] || [ -n "$DECRYPTED_PATH" ] || [ -n "$DOWNLOAD_PATH" ]; then
     echo "Cleaning up temporary files"
@@ -27,7 +29,6 @@ cleanup() {
     rm -f "$DOWNLOAD_PATH"
   fi
 }
-trap cleanup EXIT
 
 if [ "${S3_BUCKET}" = "**None**" ]; then
   echo "You need to set the S3_BUCKET environment variable."
@@ -102,6 +103,20 @@ LOCAL_FILE=$(basename "$BACKUP_FILE")
 DOWNLOAD_PATH="/tmp/$LOCAL_FILE"
 ENCRYPTED_PATH=""
 DECRYPTED_PATH=""
+
+restore_on_exit() {
+  rc=$?
+  trap - EXIT
+  set +e
+  cleanup
+  if [ "$rc" -ne 0 ]; then
+    run_error_hooks restore-error "$rc"
+  fi
+  exit "$rc"
+}
+trap restore_on_exit EXIT
+
+run_hooks pre-restore
 
 echo "Downloading backup file from S3: s3://${S3_BUCKET}/${BACKUP_FILE}"
 aws $AWS_ARGS s3 cp "s3://${S3_BUCKET}/${BACKUP_FILE}" "$DOWNLOAD_PATH" || exit 2
@@ -185,5 +200,7 @@ case "$DOWNLOAD_PATH" in
 esac
 
 echo "Database restore completed successfully"
+
+run_hooks post-restore
 
 >&2 echo "-----"

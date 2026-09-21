@@ -72,6 +72,8 @@ spec:
           value: ""
         - name: SCHEDULE
           value: ""
+        - name: HOOK_POST_BACKUP_URL
+          value: ""
 ```
 
 ## Environment variables
@@ -105,6 +107,15 @@ spec:
 | BACKUP_FILE          |           | Y*       | Required for restore. The path to the backup file in S3, format: S3_PREFIX/filename                                      |
 | CREATE_DATABASE      | no        |          | For restore: Set to `yes` to create the database if it doesn't exist                                                     |
 | DROP_DATABASE        | no        |          | For restore: Set to `yes` to drop the database before restoring (caution: destroys existing data). Use with CREATE_DATABASE=yes to recreate it |
+| HOOKS_DIR            | /hooks    |          | Directory of optional executable hook scripts named after each event (see Lifecycle hooks) |
+| HOOK_PRE_BACKUP_URL  |           |          | HTTPS URL pinged after backup validation and before the dump (e.g. Healthchecks `/start`) |
+| HOOK_POST_BACKUP_URL |           |          | HTTPS URL pinged after a successful backup (heartbeat / success ping) |
+| HOOK_BACKUP_ERROR_URL |          |          | HTTPS URL pinged if backup fails after validation (e.g. Healthchecks `/fail`) |
+| HOOK_PRE_RESTORE_URL |           |          | HTTPS URL pinged after restore validation and before download |
+| HOOK_POST_RESTORE_URL |          |          | HTTPS URL pinged after a successful restore |
+| HOOK_RESTORE_ERROR_URL |         |          | HTTPS URL pinged if restore fails after validation |
+| HOOK_ALLOW_HTTP      | no        |          | Set to `yes` to allow `http://` hook URLs (HTTPS only by default) |
+| HOOK_INHERIT_ENV     | no        |          | Set to `yes` so script hooks inherit the full container environment (including secrets). Default is a scrubbed allowlist |
 
 ### Custom / self-signed S3 CA
 
@@ -189,3 +200,48 @@ $ docker run ... -e PARALLEL_JOBS=4 -e BACKUP_FILE=backup/dbname_0000-00-00T00:0
 ```
 
 Note: Custom format is not available when using `POSTGRES_DATABASE=all` as pg_dumpall does not support this format.
+
+### Lifecycle hooks
+
+Optional hooks run at backup and restore lifecycle points. They are **not** shell snippets from the environment: a URL is requested with `curl` as an argument list, and custom logic is an executable file you mount. That avoids treating a ConfigMap or chart value as root shell.
+
+Events (script path is `$HOOKS_DIR/<event>`):
+
+- `pre-backup` / `HOOK_PRE_BACKUP_URL` — after validation, before dump
+- `post-backup` / `HOOK_POST_BACKUP_URL` — dump, encrypt, upload, and optional retention delete all succeeded
+- `backup-error` / `HOOK_BACKUP_ERROR_URL` — non-zero exit after backup hooks were armed
+- `pre-restore` / `HOOK_PRE_RESTORE_URL` — after validation, before download
+- `post-restore` / `HOOK_POST_RESTORE_URL` — restore completed
+- `restore-error` / `HOOK_RESTORE_ERROR_URL` — non-zero exit after restore hooks were armed
+
+For each event the container runs the script (if present) and then the URL (if set). Either may be omitted. Heartbeat monitors typically only need the success URL:
+
+```sh
+$ docker run ... -e HOOK_POST_BACKUP_URL=https://hc-ping.com/<uuid> ... itbm/postgres-backup-s3
+```
+
+Healthchecks.io start/fail pings:
+
+```sh
+$ docker run ... \
+  -e HOOK_PRE_BACKUP_URL=https://hc-ping.com/<uuid>/start \
+  -e HOOK_POST_BACKUP_URL=https://hc-ping.com/<uuid> \
+  -e HOOK_BACKUP_ERROR_URL=https://hc-ping.com/<uuid>/fail \
+  ... itbm/postgres-backup-s3
+```
+
+Mounted script example:
+
+```sh
+$ docker run ... -v /path/to/post-backup:/hooks/post-backup:ro ... itbm/postgres-backup-s3
+```
+
+The file must be executable. Hook scripts and URL pings run as the unprivileged `hook` user. `/hooks` is owned by root and is not writable by that user.
+
+By default script hooks receive only an allowlisted environment (`PATH`, `HOME`, `HOOK_EVENT`, `POSTGRES_DATABASE`, `POSTGRES_HOST`, `POSTGRES_PORT`, `POSTGRES_USER`, `S3_BUCKET`, `S3_PREFIX`, `S3_REGION`, `S3_ENDPOINT`, `BACKUP_DEST_FILE`, `BACKUP_S3_URI`, `BACKUP_FILE`, `TZ`, and `HOOK_EXIT_CODE` on error events). Passwords, AWS keys, session tokens, and IRSA/web-identity files are not passed. Set `HOOK_INHERIT_ENV=yes` only if a script must use those credentials.
+
+URL hooks are HTTPS GET requests with no body and no secret headers. URLs are not written to logs (ping tokens are capabilities). Loopback, link-local/IMDS, and `metadata.google.internal` hosts are rejected, credentials in the URL (`user:pass@`) are rejected, and redirects are not followed. HTTP is off unless `HOOK_ALLOW_HTTP=yes`.
+
+`pre-*` and `post-*` hooks fail closed: a hook failure fails the job. Error hooks are best-effort so they cannot hide the original backup or restore exit code. Validation errors (missing `S3_BUCKET`, and similar) occur before hooks are armed and do not fire `*-error` URLs.
+
+Missing env vars and `**None**` leave current behaviour unchanged: no hooks run.

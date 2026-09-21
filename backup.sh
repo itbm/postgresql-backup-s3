@@ -9,6 +9,14 @@ has_value() {
   [ -n "$1" ] && [ "$1" != "**None**" ]
 }
 
+. "$(dirname "$0")/hooks.sh"
+
+set_backup_uri() {
+  BACKUP_DEST_FILE=$DEST_FILE
+  BACKUP_S3_URI="s3://${S3_BUCKET}/${S3_PREFIX}/${DEST_FILE}"
+  export BACKUP_DEST_FILE BACKUP_S3_URI
+}
+
 if [ "${S3_BUCKET}" = "**None**" ]; then
   echo "You need to set the S3_BUCKET environment variable."
   exit 1
@@ -72,21 +80,35 @@ export PGPASSWORD=$POSTGRES_PASSWORD
 POSTGRES_HOST_OPTS="-h $POSTGRES_HOST -p $POSTGRES_PORT -U $POSTGRES_USER $POSTGRES_EXTRA_OPTS"
 POSTGRES_DUMP_OPTS="$POSTGRES_EXTRA_DUMP_OPTS"
 
-echo "Creating dump of ${POSTGRES_DATABASE} database from ${POSTGRES_HOST}..."
-
-TIMESTAMP=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
-
 cleanup_src() {
   if [ -n "$SRC_FILE" ]; then
     rm -f "$SRC_FILE"
   fi
   rm -f /tmp/s3-listing
 }
-trap cleanup_src EXIT
+
+backup_on_exit() {
+  rc=$?
+  trap - EXIT
+  set +e
+  cleanup_src
+  if [ "$rc" -ne 0 ]; then
+    run_error_hooks backup-error "$rc"
+  fi
+  exit "$rc"
+}
+trap backup_on_exit EXIT
+
+run_hooks pre-backup
+
+echo "Creating dump of ${POSTGRES_DATABASE} database from ${POSTGRES_HOST}..."
+
+TIMESTAMP=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
 
 if [ "$USE_CUSTOM_FORMAT" = "yes" ]; then
   SRC_FILE=/tmp/dump.dump
   DEST_FILE="${POSTGRES_DATABASE}_${TIMESTAMP}.dump"
+  set_backup_uri
   rm -f "$SRC_FILE"
 
   if [ "${POSTGRES_DATABASE}" = "all" ]; then
@@ -98,6 +120,7 @@ if [ "$USE_CUSTOM_FORMAT" = "yes" ]; then
 else
   SRC_FILE=/tmp/dump.sql.gz
   DEST_FILE="${POSTGRES_DATABASE}_${TIMESTAMP}.sql.gz"
+  set_backup_uri
   rm -f "$SRC_FILE"
 
   if [ "${POSTGRES_DATABASE}" = "all" ]; then
@@ -116,6 +139,7 @@ if [ "${ENCRYPTION_PASSWORD}" != "**None**" ]; then
   rm -f "$SRC_FILE"
   SRC_FILE="${SRC_FILE}.enc"
   DEST_FILE="${DEST_FILE}.enc"
+  set_backup_uri
 fi
 
 echo "Uploading dump to $S3_BUCKET"
@@ -153,5 +177,7 @@ if [ "${DELETE_OLDER_THAN}" != "**None**" ]; then
 fi
 
 echo "SQL backup finished"
+
+run_hooks post-backup
 
 >&2 echo "-----"

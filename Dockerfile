@@ -17,7 +17,11 @@ LABEL maintainer="ITBM"
 
 RUN apk update \
 	&& apk upgrade \
-	&& apk add coreutils postgresql18-client aws-cli openssl pigz ca-certificates \
+	&& apk add coreutils postgresql18-client aws-cli openssl pigz ca-certificates curl su-exec \
+	&& adduser -D -H -s /sbin/nologin hook \
+	&& mkdir -p /hooks \
+	&& chown root:root /hooks \
+	&& chmod 755 /hooks \
 	&& rm -rf /var/cache/apk/*
 
 COPY --from=build /app/out/go-cron /usr/local/bin/go-cron
@@ -49,9 +53,19 @@ ENV COMPRESSION_CMD 'gzip'
 ENV DECOMPRESSION_CMD 'gunzip -c'
 ENV PARALLEL_JOBS 1
 ENV COMMAND_TIMEOUT **None**
+ENV HOOKS_DIR /hooks
+ENV HOOK_PRE_BACKUP_URL **None**
+ENV HOOK_POST_BACKUP_URL **None**
+ENV HOOK_BACKUP_ERROR_URL **None**
+ENV HOOK_PRE_RESTORE_URL **None**
+ENV HOOK_POST_RESTORE_URL **None**
+ENV HOOK_RESTORE_ERROR_URL **None**
+ENV HOOK_ALLOW_HTTP no
+ENV HOOK_INHERIT_ENV no
 
 ADD run.sh run.sh
 ADD backup.sh backup.sh
 ADD restore.sh restore.sh
+ADD hooks.sh hooks.sh
 
 CMD ["sh", "run.sh"]
