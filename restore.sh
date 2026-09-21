@@ -78,6 +78,10 @@ else
   AWS_ARGS="--endpoint-url ${S3_ENDPOINT}"
 fi
 
+if [ "${S3_SSL_VERIFY}" = "no" ]; then
+  AWS_ARGS="$AWS_ARGS --no-verify-ssl"
+fi
+
 if [ "${BACKUP_FILE}" = "**None**" ]; then
   echo "You need to set the BACKUP_FILE environment variable with the backup filename to restore."
   echo "Use S3_PREFIX/filename format. Example: backup/database_0000-00-00T00:00:00Z.sql.gz"

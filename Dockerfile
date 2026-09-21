@@ -17,7 +17,7 @@ LABEL maintainer="ITBM"
 
 RUN apk update \
 	&& apk upgrade \
-	&& apk add coreutils postgresql18-client aws-cli openssl pigz curl su-exec \
+	&& apk add coreutils postgresql18-client aws-cli openssl pigz ca-certificates curl su-exec \
 	&& adduser -D -H -s /sbin/nologin hook \
 	&& mkdir -p /hooks \
 	&& chown root:root /hooks \
@@ -39,6 +39,8 @@ ENV S3_BUCKET **None**
 ENV S3_REGION us-west-1
 ENV S3_PREFIX 'backup'
 ENV S3_ENDPOINT **None**
+ENV S3_CA_BUNDLE **None**
+ENV S3_SSL_VERIFY yes
 ENV S3_S3V4 no
 ENV SCHEDULE **None**
 ENV ENCRYPTION_PASSWORD **None**
