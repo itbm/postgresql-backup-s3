@@ -91,6 +91,8 @@ spec:
 | S3_PREFIX            | backup    |          | Path prefix in your bucket                                                                                               |
 | S3_REGION            | us-west-1 |          | The AWS S3 bucket region                                                                                                 |
 | S3_ENDPOINT          |           |          | The AWS Endpoint URL, for S3 Compliant APIs such as [minio](https://minio.io)                                            |
+| S3_CA_BUNDLE         |           |          | Path to a CA file or bundle used for S3 HTTPS (sets `AWS_CA_BUNDLE`)                                                     |
+| S3_SSL_VERIFY        | yes       |          | Set to `no` to disable TLS verification (`aws --no-verify-ssl`). Insecure; prefer a custom CA instead                    |
 | S3_S3V4              | no        |          | Set to `yes` to enable AWS Signature Version 4, required for [minio](https://minio.io) servers                           |
 | SCHEDULE             |           |          | Backup schedule time, see explainatons below                                                                             |
 | COMMAND_TIMEOUT      |           |          | Max duration for a scheduled backup (`go` duration, e.g. `2h`). Empty/`0` disables the timeout (default)                 |
@@ -103,6 +105,38 @@ spec:
 | BACKUP_FILE          |           | Y*       | Required for restore. The path to the backup file in S3, format: S3_PREFIX/filename                                      |
 | CREATE_DATABASE      | no        |          | For restore: Set to `yes` to create the database if it doesn't exist                                                     |
 | DROP_DATABASE        | no        |          | For restore: Set to `yes` to drop the database before restoring (caution: destroys existing data). Use with CREATE_DATABASE=yes to recreate it |
+
+### Custom / self-signed S3 CA
+
+AWS CLI v2 does not always use the system trust store. For S3-compatible endpoints that use a private or self-signed certificate, prefer trusting the CA rather than disabling verification.
+
+1. **Mount extra CAs** (preferred): copy or volume-mount PEM files named `*.crt` into `/usr/local/share/ca-certificates/`. On start the container runs `update-ca-certificates` and points AWS CLI at the system bundle.
+
+```sh
+$ docker run ... -v /path/to/minio.crt:/usr/local/share/ca-certificates/minio.crt:ro itbm/postgres-backup-s3
+```
+
+Kubernetes ConfigMap example:
+
+```yaml
+volumeMounts:
+  - name: s3-ca
+    mountPath: /usr/local/share/ca-certificates/minio.crt
+    subPath: minio.crt
+    readOnly: true
+volumes:
+  - name: s3-ca
+    configMap:
+      name: s3-ca
+```
+
+2. **Bundle path**: set `S3_CA_BUNDLE` (or `AWS_CA_BUNDLE`) to a mounted CA file or bundle. `S3_CA_BUNDLE` overrides the auto system path.
+
+```sh
+$ docker run ... -v /path/to/ca.pem:/certs/ca.pem:ro -e S3_CA_BUNDLE=/certs/ca.pem itbm/postgres-backup-s3
+```
+
+3. **Last resort** (insecure): `-e S3_SSL_VERIFY=no` passes `--no-verify-ssl` to every `aws` call (backup upload, restore download, and old-backup deletion).
 
 ### Automatic Periodic Backups
 

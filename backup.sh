@@ -57,6 +57,10 @@ else
   AWS_ARGS="--endpoint-url ${S3_ENDPOINT}"
 fi
 
+if [ "${S3_SSL_VERIFY}" = "no" ]; then
+  AWS_ARGS="$AWS_ARGS --no-verify-ssl"
+fi
+
 # Avoid AWS CLI v2 default checksum behaviour that breaks many S3-compatible
 # endpoints and some streaming uploads (XAmzContentSHA256Mismatch).
 export AWS_REQUEST_CHECKSUM_CALCULATION="${AWS_REQUEST_CHECKSUM_CALCULATION:-when_required}"
