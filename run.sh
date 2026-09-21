@@ -4,7 +4,7 @@ set -e
 
 # Trust extra CAs dropped into Alpine's standard directory (must be named *.crt).
 if ls /usr/local/share/ca-certificates/*.crt >/dev/null 2>&1; then
-  update-ca-certificates
+  update-ca-certificates >/dev/null
   export AWS_CA_BUNDLE="${AWS_CA_BUNDLE:-/etc/ssl/certs/ca-certificates.crt}"
 fi
 
