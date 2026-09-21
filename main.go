@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/robfig/cron/v3"
@@ -43,6 +44,21 @@ func validateSchedule(schedule string) error {
 	return err
 }
 
+func commandTimeout() (time.Duration, error) {
+	raw := strings.TrimSpace(os.Getenv("COMMAND_TIMEOUT"))
+	if raw == "" || raw == "0" || raw == "**None**" {
+		return 0, nil
+	}
+	d, err := time.ParseDuration(raw)
+	if err != nil {
+		return 0, fmt.Errorf("invalid COMMAND_TIMEOUT %q: %w", raw, err)
+	}
+	if d < 0 {
+		return 0, fmt.Errorf("invalid COMMAND_TIMEOUT %q: must be >= 0", raw)
+	}
+	return d, nil
+}
+
 func main() {
 	if len(os.Args) < 3 {
 		fmt.Println("Usage: go-cron <schedule> <command> [args...]")
@@ -65,13 +81,30 @@ func main() {
 		os.Exit(1)
 	}
 
-	c := cron.New()
+	timeout, err := commandTimeout()
+	if err != nil {
+		timestampedPrint("ERROR", fmt.Sprintf("%v\n", err))
+		os.Exit(1)
+	}
 
-	_, err := c.AddFunc(schedule, func() {
+	c := cron.New()
+	var mu sync.Mutex
+
+	_, err = c.AddFunc(schedule, func() {
+		if !mu.TryLock() {
+			timestampedPrint("WARN", "Previous command still running; skipping this run\n")
+			return
+		}
+		defer mu.Unlock()
+
 		timestampedPrint("INFO", fmt.Sprintf("Executing command: %s %v\n", command, args))
 
-		ctx, cancel := context.WithTimeout(context.Background(), 1*time.Hour)
-		defer cancel()
+		ctx := context.Background()
+		var cancel context.CancelFunc
+		if timeout > 0 {
+			ctx, cancel = context.WithTimeout(context.Background(), timeout)
+			defer cancel()
+		}
 
 		cmd := exec.CommandContext(ctx, command, args...)
 
@@ -98,8 +131,8 @@ func main() {
 
 		err = cmd.Wait()
 		if err != nil {
-			if ctx.Err() == context.DeadlineExceeded {
-				timestampedPrint("ERROR", "Command timed out after 1 hour\n")
+			if timeout > 0 && ctx.Err() == context.DeadlineExceeded {
+				timestampedPrint("ERROR", fmt.Sprintf("Command timed out after %s\n", timeout))
 			} else {
 				timestampedPrint("ERROR", fmt.Sprintf("Command finished with error: %v\n", err))
 			}
@@ -115,6 +148,11 @@ func main() {
 
 	timestampedPrint("INFO", fmt.Sprintf("Cron job scheduled: %s\n", schedule))
 	timestampedPrint("INFO", fmt.Sprintf("Command to run: %s %v\n", command, strings.Join(args, " ")))
+	if timeout > 0 {
+		timestampedPrint("INFO", fmt.Sprintf("Command timeout: %s\n", timeout))
+	} else {
+		timestampedPrint("INFO", "Command timeout: disabled\n")
+	}
 
 	c.Run()
 }

@@ -1,4 +1,4 @@
-FROM alpine:3.23 AS build
+FROM alpine:3.24 AS build
 
 WORKDIR /app
 
@@ -12,7 +12,7 @@ RUN go mod init github.com/itbm/postgresql-backup-s3 \
 	&& go get github.com/robfig/cron/v3 \
 	&& go build -o out/go-cron
 
-FROM alpine:3.23
+FROM alpine:3.24
 LABEL maintainer="ITBM"
 
 RUN apk update \
@@ -28,6 +28,7 @@ ENV POSTGRES_PORT 5432
 ENV POSTGRES_USER **None**
 ENV POSTGRES_PASSWORD **None**
 ENV POSTGRES_EXTRA_OPTS ''
+ENV POSTGRES_EXTRA_DUMP_OPTS ''
 ENV S3_ACCESS_KEY_ID **None**
 ENV S3_SECRET_ACCESS_KEY **None**
 ENV S3_BUCKET **None**
@@ -45,6 +46,7 @@ ENV USE_CUSTOM_FORMAT no
 ENV COMPRESSION_CMD 'gzip'
 ENV DECOMPRESSION_CMD 'gunzip -c'
 ENV PARALLEL_JOBS 1
+ENV COMMAND_TIMEOUT **None**
 
 ADD run.sh run.sh
 ADD backup.sh backup.sh
