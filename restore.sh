@@ -9,8 +9,14 @@ quote_ident() {
   printf '"%s"' "$(printf '%s' "$1" | sed 's/"/""/g')"
 }
 
+has_value() {
+  [ -n "$1" ] && [ "$1" != "**None**" ]
+}
+
 cleanup() {
-  echo "Cleaning up temporary files"
+  if [ -n "$ENCRYPTED_PATH" ] || [ -n "$DECRYPTED_PATH" ] || [ -n "$DOWNLOAD_PATH" ]; then
+    echo "Cleaning up temporary files"
+  fi
   if [ -n "$ENCRYPTED_PATH" ]; then
     rm -f "$ENCRYPTED_PATH"
   fi
@@ -22,16 +28,6 @@ cleanup() {
   fi
 }
 trap cleanup EXIT
-
-if [ "${S3_ACCESS_KEY_ID}" = "**None**" ]; then
-  echo "You need to set the S3_ACCESS_KEY_ID environment variable."
-  exit 1
-fi
-
-if [ "${S3_SECRET_ACCESS_KEY}" = "**None**" ]; then
-  echo "You need to set the S3_SECRET_ACCESS_KEY environment variable."
-  exit 1
-fi
 
 if [ "${S3_BUCKET}" = "**None**" ]; then
   echo "You need to set the S3_BUCKET environment variable."
@@ -63,6 +59,18 @@ if [ "${POSTGRES_PASSWORD}" = "**None**" ]; then
   exit 1
 fi
 
+if has_value "${S3_ACCESS_KEY_ID}"; then
+  if ! has_value "${S3_SECRET_ACCESS_KEY}"; then
+    echo "You need to set the S3_SECRET_ACCESS_KEY environment variable."
+    exit 1
+  fi
+  export AWS_ACCESS_KEY_ID=$S3_ACCESS_KEY_ID
+  export AWS_SECRET_ACCESS_KEY=$S3_SECRET_ACCESS_KEY
+elif has_value "${S3_SECRET_ACCESS_KEY}"; then
+  echo "You need to set the S3_ACCESS_KEY_ID environment variable."
+  exit 1
+fi
+
 if [ "${S3_ENDPOINT}" = "**None**" ]; then
   AWS_ARGS=""
 else
@@ -80,8 +88,6 @@ fi
 export AWS_REQUEST_CHECKSUM_CALCULATION="${AWS_REQUEST_CHECKSUM_CALCULATION:-when_required}"
 export AWS_RESPONSE_CHECKSUM_VALIDATION="${AWS_RESPONSE_CHECKSUM_VALIDATION:-when_required}"
 
-export AWS_ACCESS_KEY_ID=$S3_ACCESS_KEY_ID
-export AWS_SECRET_ACCESS_KEY=$S3_SECRET_ACCESS_KEY
 export AWS_DEFAULT_REGION=$S3_REGION
 
 export PGPASSWORD=$POSTGRES_PASSWORD
@@ -107,8 +113,8 @@ case "$LOCAL_FILE" in
     ENCRYPTED_PATH="$DOWNLOAD_PATH"
     DECRYPTED_PATH="${DOWNLOAD_PATH%.enc}"
     # Prefer PBKDF2 (current format); fall back to legacy OpenSSL key derivation.
-    if ! openssl enc -aes-256-cbc -d -pbkdf2 -iter 100000 -in "$ENCRYPTED_PATH" -out "$DECRYPTED_PATH" -pass "pass:${ENCRYPTION_PASSWORD}" 2>/dev/null; then
-      if ! openssl enc -aes-256-cbc -d -in "$ENCRYPTED_PATH" -out "$DECRYPTED_PATH" -pass "pass:${ENCRYPTION_PASSWORD}"; then
+    if ! openssl enc -aes-256-cbc -d -pbkdf2 -iter 100000 -in "$ENCRYPTED_PATH" -out "$DECRYPTED_PATH" -pass env:ENCRYPTION_PASSWORD 2>/dev/null; then
+      if ! openssl enc -aes-256-cbc -d -in "$ENCRYPTED_PATH" -out "$DECRYPTED_PATH" -pass env:ENCRYPTION_PASSWORD; then
         echo "Error decrypting backup file. Check your encryption password."
         exit 1
       fi
@@ -127,7 +133,9 @@ if [ "${DROP_DATABASE}" = "yes" ]; then
   fi
   echo "Dropping database ${POSTGRES_DATABASE}"
   if ! psql $POSTGRES_HOST_OPTS -d postgres -c "DROP DATABASE IF EXISTS ${POSTGRES_DATABASE_IDENT} WITH (FORCE);" > /dev/null 2>&1; then
-    echo "WARNING: Failed to drop database ${POSTGRES_DATABASE}. It might not exist."
+    if ! psql $POSTGRES_HOST_OPTS -d postgres -c "DROP DATABASE IF EXISTS ${POSTGRES_DATABASE_IDENT};" > /dev/null 2>&1; then
+      echo "WARNING: Failed to drop database ${POSTGRES_DATABASE}."
+    fi
   fi
 fi
 

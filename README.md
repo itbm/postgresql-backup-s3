@@ -1,6 +1,8 @@
 # postgres-backup-s3
 
-Backup and restore PostgreSQL to/from S3 (supports periodic backups and encryption)
+Backup and restore PostgreSQL to/from S3 (supports periodic backups and encryption).
+
+The image is based on Alpine 3.24 and ships the PostgreSQL 18 client (`postgresql18-client`), the current stable major release. PostgreSQL 19 is not used yet because it is still in beta.
 
 ## Basic Usage
 
@@ -83,8 +85,8 @@ spec:
 | POSTGRES_PASSWORD    |           | Y        | The PostgreSQL password                                                                                                  |
 | POSTGRES_EXTRA_OPTS  |           |          | Extra options passed to all PostgreSQL client commands (`pg_dump`, `psql`, `pg_restore`, etc.)                           |
 | POSTGRES_EXTRA_DUMP_OPTS |       |          | Extra options passed only to `pg_dump`/`pg_dumpall` (e.g. `--exclude-table=public.foo`)                                  |
-| S3_ACCESS_KEY_ID     |           | Y        | Your AWS access key                                                                                                      |
-| S3_SECRET_ACCESS_KEY |           | Y        | Your AWS secret key                                                                                                      |
+| S3_ACCESS_KEY_ID     |           |          | AWS access key. Optional when using the default AWS credential chain (IAM role, instance profile, etc.)                  |
+| S3_SECRET_ACCESS_KEY |           |          | AWS secret key. Required if `S3_ACCESS_KEY_ID` is set                                                                    |
 | S3_BUCKET            |           | Y        | Your AWS S3 bucket path                                                                                                  |
 | S3_PREFIX            | backup    |          | Path prefix in your bucket                                                                                               |
 | S3_REGION            | us-west-1 |          | The AWS S3 bucket region                                                                                                 |
