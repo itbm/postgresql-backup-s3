@@ -20,6 +20,8 @@ $ docker run -e S3_ACCESS_KEY_ID=key -e S3_SECRET_ACCESS_KEY=secret -e S3_BUCKET
 
 Note: When `BACKUP_FILE` is provided, the container automatically runs the restore process instead of backup.
 
+Plain SQL restores of a single database stop at the first SQL error, so a partial restore is reported as a failure. Restoring into a database that already contains the same tables fails for this reason; use `DROP_DATABASE=yes` and `CREATE_DATABASE=yes` to restore into a clean database, or set `RESTORE_ON_ERROR_STOP=no` to keep the old behaviour.
+
 ## Kubernetes Deployment
 
 ```
@@ -78,6 +80,8 @@ spec:
 
 ## Environment variables
 
+An empty value is treated the same as an unset variable.
+
 | Variable             | Default   | Required | Description                                                                                                              |
 |----------------------|-----------|----------|--------------------------------------------------------------------------------------------------------------------------|
 | POSTGRES_DATABASE    |           | Y        | Database you want to backup/restore or 'all' to backup/restore everything                                               |
@@ -90,13 +94,13 @@ spec:
 | S3_ACCESS_KEY_ID     |           |          | AWS access key. Optional when using the default AWS credential chain (IAM role, instance profile, etc.)                  |
 | S3_SECRET_ACCESS_KEY |           |          | AWS secret key. Required if `S3_ACCESS_KEY_ID` is set                                                                    |
 | S3_BUCKET            |           | Y        | Your AWS S3 bucket path                                                                                                  |
-| S3_PREFIX            | backup    |          | Path prefix in your bucket                                                                                               |
+| S3_PREFIX            | backup    |          | Path prefix in your bucket. Leading and trailing slashes are ignored; leave empty to store backups at the bucket root      |
 | S3_REGION            | us-west-1 |          | The AWS S3 bucket region                                                                                                 |
 | S3_ENDPOINT          |           |          | The AWS Endpoint URL, for S3 Compliant APIs such as [minio](https://minio.io)                                            |
 | S3_CA_BUNDLE         |           |          | Path to a CA file or bundle used for S3 HTTPS (sets `AWS_CA_BUNDLE`)                                                     |
 | S3_SSL_VERIFY        | yes       |          | Set to `no` to disable TLS verification (`aws --no-verify-ssl`). Insecure; prefer a custom CA instead                    |
 | S3_S3V4              | no        |          | Set to `yes` to enable AWS Signature Version 4, required for [minio](https://minio.io) servers                           |
-| SCHEDULE             |           |          | Backup schedule time, see explainatons below                                                                             |
+| SCHEDULE             |           |          | Backup schedule, see [Automatic Periodic Backups](#automatic-periodic-backups)                                          |
 | COMMAND_TIMEOUT      |           |          | Max duration for a scheduled backup (`go` duration, e.g. `2h`). Empty/`0` disables the timeout (default)                 |
 | ENCRYPTION_PASSWORD  |           |          | Password to encrypt/decrypt the backup                                                                                   |
 | DELETE_OLDER_THAN    |           |          | Delete old backups, see explanation and warning below                                                                    |
@@ -106,7 +110,8 @@ spec:
 | PARALLEL_JOBS        | 1         |          | Number of parallel jobs for pg_restore when using custom format backups                                                  |
 | BACKUP_FILE          |           | Y*       | Required for restore. The path to the backup file in S3, format: S3_PREFIX/filename                                      |
 | CREATE_DATABASE      | no        |          | For restore: Set to `yes` to create the database if it doesn't exist                                                     |
-| DROP_DATABASE        | no        |          | For restore: Set to `yes` to drop the database before restoring (caution: destroys existing data). Use with CREATE_DATABASE=yes to recreate it |
+| DROP_DATABASE        | no        |          | For restore: Set to `yes` to drop the database before restoring (caution: destroys existing data). Use with CREATE_DATABASE=yes to recreate it. The restore fails if the drop fails |
+| RESTORE_ON_ERROR_STOP |          |          | For plain SQL restores: `yes` stops at the first SQL error and fails the restore; `no` continues past errors. Defaults to `yes` for a single database and `no` for `POSTGRES_DATABASE=all` |
 | HOOKS_DIR            | /hooks    |          | Directory of optional executable hook scripts named after each event (see Lifecycle hooks) |
 | HOOK_PRE_BACKUP_URL  |           |          | HTTPS URL pinged after backup validation and before the dump (e.g. Healthchecks `/start`) |
 | HOOK_POST_BACKUP_URL |           |          | HTTPS URL pinged after a successful backup (heartbeat / success ping) |
@@ -153,7 +158,9 @@ $ docker run ... -v /path/to/ca.pem:/certs/ca.pem:ro -e S3_CA_BUNDLE=/certs/ca.p
 
 You can additionally set the `SCHEDULE` environment variable like `-e SCHEDULE="@daily"` to run the backup automatically.
 
-If a run is still in progress when the next schedule fires, the overlapping run is skipped. Optionally set `COMMAND_TIMEOUT` (for example `-e COMMAND_TIMEOUT=2h`) to limit how long a single scheduled backup may run; by default there is no timeout.
+If a run is still in progress when the next schedule fires, the overlapping run is skipped. Optionally set `COMMAND_TIMEOUT` (for example `-e COMMAND_TIMEOUT=2h`) to limit how long a single scheduled backup may run; by default there is no timeout. When the timeout expires, the backup and all of its child processes (`pg_dump`, `aws` and so on) receive `SIGTERM`, then `SIGKILL` after 30 seconds.
+
+Stopping the container (`docker stop`) stops the scheduler and terminates a running backup the same way, so temporary files are removed and the `backup-error` hook runs.
 
 More information about the scheduling can be found [here](http://godoc.org/github.com/robfig/cron#hdr-Predefined_schedules).
 
