@@ -20,6 +20,10 @@ $ docker run -e S3_ACCESS_KEY_ID=key -e S3_SECRET_ACCESS_KEY=secret -e S3_BUCKET
 
 Note: When `BACKUP_FILE` is provided, the container automatically runs the restore process instead of backup.
 
+Set `BACKUP_FILE=latest` to restore the newest backup of `POSTGRES_DATABASE` in `S3_PREFIX`. It picks the most recent file named `<POSTGRES_DATABASE>_<timestamp>` with a `.sql.gz`, `.dump` or `.enc` extension, and fails if there is none.
+
+Plain SQL restores of a single database stop at the first SQL error, so a partial restore is reported as a failure. Restoring into a database that already contains the same tables fails for this reason; use `DROP_DATABASE=yes` and `CREATE_DATABASE=yes` to restore into a clean database, or set `RESTORE_ON_ERROR_STOP=no` to keep the old behaviour.
+
 ## Kubernetes Deployment
 
 ```
@@ -78,6 +82,10 @@ spec:
 
 ## Environment variables
 
+An empty value is treated the same as an unset variable.
+
+`POSTGRES_USER`, `POSTGRES_PASSWORD`, `S3_ACCESS_KEY_ID`, `S3_SECRET_ACCESS_KEY` and `ENCRYPTION_PASSWORD` can also be read from a file by setting the same name with a `_FILE` suffix, for example `POSTGRES_PASSWORD_FILE=/run/secrets/postgres_password`. This works with Docker and Kubernetes secrets. A trailing newline in the file is ignored. Setting both a variable and its `_FILE` form is an error.
+
 | Variable             | Default   | Required | Description                                                                                                              |
 |----------------------|-----------|----------|--------------------------------------------------------------------------------------------------------------------------|
 | POSTGRES_DATABASE    |           | Y        | Database you want to backup/restore or 'all' to backup/restore everything                                               |
@@ -90,23 +98,30 @@ spec:
 | S3_ACCESS_KEY_ID     |           |          | AWS access key. Optional when using the default AWS credential chain (IAM role, instance profile, etc.)                  |
 | S3_SECRET_ACCESS_KEY |           |          | AWS secret key. Required if `S3_ACCESS_KEY_ID` is set                                                                    |
 | S3_BUCKET            |           | Y        | Your AWS S3 bucket path                                                                                                  |
-| S3_PREFIX            | backup    |          | Path prefix in your bucket                                                                                               |
+| S3_PREFIX            | backup    |          | Path prefix in your bucket. Leading and trailing slashes are ignored; leave empty to store backups at the bucket root      |
 | S3_REGION            | us-west-1 |          | The AWS S3 bucket region                                                                                                 |
 | S3_ENDPOINT          |           |          | The AWS Endpoint URL, for S3 Compliant APIs such as [minio](https://minio.io)                                            |
 | S3_CA_BUNDLE         |           |          | Path to a CA file or bundle used for S3 HTTPS (sets `AWS_CA_BUNDLE`)                                                     |
 | S3_SSL_VERIFY        | yes       |          | Set to `no` to disable TLS verification (`aws --no-verify-ssl`). Insecure; prefer a custom CA instead                    |
 | S3_S3V4              | no        |          | Set to `yes` to enable AWS Signature Version 4, required for [minio](https://minio.io) servers                           |
-| SCHEDULE             |           |          | Backup schedule time, see explainatons below                                                                             |
+| S3_STORAGE_CLASS     |           |          | Storage class for uploaded backups, for example `STANDARD_IA` or `GLACIER_IR`                                              |
+| S3_SSE               |           |          | Server-side encryption for uploaded backups: `AES256`, `aws:kms` or `aws:kms:dsse`                                         |
+| S3_SSE_KMS_KEY_ID    |           |          | KMS key ID or alias for `S3_SSE=aws:kms` or `aws:kms:dsse`                                                               |
+| SCHEDULE             |           |          | Backup schedule, see [Automatic Periodic Backups](#automatic-periodic-backups)                                          |
+| BACKUP_ON_START      | no        |          | With `SCHEDULE`, set to `yes` to run a backup as soon as the container starts, then follow the schedule                  |
 | COMMAND_TIMEOUT      |           |          | Max duration for a scheduled backup (`go` duration, e.g. `2h`). Empty/`0` disables the timeout (default)                 |
+| TZ                   | UTC       |          | Time zone for logs, `SCHEDULE` and `DELETE_OLDER_THAN`, for example `Europe/London`. Backup file names always use UTC     |
 | ENCRYPTION_PASSWORD  |           |          | Password to encrypt/decrypt the backup                                                                                   |
 | DELETE_OLDER_THAN    |           |          | Delete old backups, see explanation and warning below                                                                    |
+| DELETE_MATCH_DATABASE | no       |          | Set to `yes` so `DELETE_OLDER_THAN` only deletes files named `<POSTGRES_DATABASE>_*` in `S3_PREFIX`                      |
 | USE_CUSTOM_FORMAT    | no        |          | Use PostgreSQL's custom format (-Fc) instead of plain text with compression                                              |
 | COMPRESSION_CMD      | gzip      |          | Command used to compress the backup (e.g. `pigz` for parallel compression) - ignored when USE_CUSTOM_FORMAT=yes          |
 | DECOMPRESSION_CMD    | gunzip -c |          | Command used to decompress the backup (e.g. `pigz -dc` for parallel decompression) - ignored when USE_CUSTOM_FORMAT=yes  |
 | PARALLEL_JOBS        | 1         |          | Number of parallel jobs for pg_restore when using custom format backups                                                  |
-| BACKUP_FILE          |           | Y*       | Required for restore. The path to the backup file in S3, format: S3_PREFIX/filename                                      |
+| BACKUP_FILE          |           | Y*       | Required for restore. The path to the backup file in S3, format: S3_PREFIX/filename, or `latest` for the newest backup    |
 | CREATE_DATABASE      | no        |          | For restore: Set to `yes` to create the database if it doesn't exist                                                     |
-| DROP_DATABASE        | no        |          | For restore: Set to `yes` to drop the database before restoring (caution: destroys existing data). Use with CREATE_DATABASE=yes to recreate it |
+| DROP_DATABASE        | no        |          | For restore: Set to `yes` to drop the database before restoring (caution: destroys existing data). Use with CREATE_DATABASE=yes to recreate it. The restore fails if the drop fails |
+| RESTORE_ON_ERROR_STOP |          |          | For plain SQL restores: `yes` stops at the first SQL error and fails the restore; `no` continues past errors. Defaults to `yes` for a single database and `no` for `POSTGRES_DATABASE=all` |
 | HOOKS_DIR            | /hooks    |          | Directory of optional executable hook scripts named after each event (see Lifecycle hooks) |
 | HOOK_PRE_BACKUP_URL  |           |          | HTTPS URL pinged after backup validation and before the dump (e.g. Healthchecks `/start`) |
 | HOOK_POST_BACKUP_URL |           |          | HTTPS URL pinged after a successful backup (heartbeat / success ping) |
@@ -151,9 +166,13 @@ $ docker run ... -v /path/to/ca.pem:/certs/ca.pem:ro -e S3_CA_BUNDLE=/certs/ca.p
 
 ### Automatic Periodic Backups
 
-You can additionally set the `SCHEDULE` environment variable like `-e SCHEDULE="@daily"` to run the backup automatically.
+You can additionally set the `SCHEDULE` environment variable like `-e SCHEDULE="@daily"` to run the backup automatically. Set `-e BACKUP_ON_START=yes` to also take a backup as soon as the container starts.
 
-If a run is still in progress when the next schedule fires, the overlapping run is skipped. Optionally set `COMMAND_TIMEOUT` (for example `-e COMMAND_TIMEOUT=2h`) to limit how long a single scheduled backup may run; by default there is no timeout.
+Schedules use the container's time zone, which is UTC unless you set `TZ`. You can also set a time zone for the schedule alone with a `CRON_TZ=` prefix, for example `-e SCHEDULE="CRON_TZ=Europe/London 0 3 * * *"`.
+
+If a run is still in progress when the next schedule fires, the overlapping run is skipped. Optionally set `COMMAND_TIMEOUT` (for example `-e COMMAND_TIMEOUT=2h`) to limit how long a single scheduled backup may run; by default there is no timeout. When the timeout expires, the backup and all of its child processes (`pg_dump`, `aws` and so on) receive `SIGTERM`, then `SIGKILL` after 30 seconds.
+
+Stopping the container (`docker stop`) terminates a running backup or restore the same way, in scheduled and one-off mode, so temporary files are removed and the `backup-error` or `restore-error` hook runs. The container exits with the backup or restore exit code in one-off mode.
 
 More information about the scheduling can be found [here](http://godoc.org/github.com/robfig/cron#hdr-Predefined_schedules).
 
@@ -161,11 +180,17 @@ More information about the scheduling can be found [here](http://godoc.org/githu
 
 You can additionally set the `DELETE_OLDER_THAN` environment variable like `-e DELETE_OLDER_THAN="30 days ago"` to delete old backups.
 
-WARNING: this will delete all files in the S3_PREFIX path, not just those created by this script.
+WARNING: by default this deletes all files in the S3_PREFIX path, not just those created by this script. Set `-e DELETE_MATCH_DATABASE=yes` to delete only this database's backups (files named `<POSTGRES_DATABASE>_*`). This is recommended when several databases or other files share a prefix.
+
+The backup uploaded by the current run is never deleted. A failed delete fails the backup, and the log shows how many files were deleted and kept.
 
 ### Encryption
 
 You can additionally set the `ENCRYPTION_PASSWORD` environment variable like `-e ENCRYPTION_PASSWORD="superstrongpassword"` to encrypt the backup. New backups use AES-256-CBC with PBKDF2 (100000 iterations). The restore process detects encrypted backups and decrypts them when `ENCRYPTION_PASSWORD` is set; legacy (pre-PBKDF2) backups are still accepted with a warning. Manual decrypt for current backups: `openssl enc -aes-256-cbc -d -pbkdf2 -iter 100000 -in backup.sql.gz.enc -out backup.sql.gz`.
+
+### Backup verification
+
+Each dump is checked before it is uploaded. An empty dump is rejected. Custom-format dumps must be readable by `pg_restore --list`, and `gzip` or `pigz` output must pass `gzip -t`. Output from other compression commands is not checked. A dump that fails these checks fails the backup and is not uploaded.
 
 ### Backup Format and Compression Options
 

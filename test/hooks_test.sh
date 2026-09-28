@@ -2,7 +2,9 @@
 # Tests for hooks.sh and backup/restore hook points.
 # Run from anywhere: sh test/hooks_test.sh
 
-ROOT=$(CDPATH= cd -- "$(dirname "$0")/.." && pwd)
+ROOT=$(CDPATH='' cd -- "$(dirname "$0")/.." && pwd)
+# Shell used to run backup.sh/restore.sh; the image uses BusyBox sh.
+SCRIPT_SHELL=${SCRIPT_SHELL:-bash}
 export HOOK_DROP_PRIVS=no
 export HOOK_ALLOW_HTTP=no
 export HOOK_INHERIT_ENV=no
@@ -206,6 +208,7 @@ cat > "$HOOKS_DIR/backup-error" <<EOF
 env | sort > "$WORKDIR/error.env"
 EOF
 chmod +x "$HOOKS_DIR/backup-error"
+# shellcheck disable=SC2034 # read by hooks.sh
 HOOK_EXIT_CODE=7
 assert_ok hook_run_script backup-error
 if grep -q '^HOOK_EXIT_CODE=7$' "$WORKDIR/error.env"; then
@@ -260,6 +263,12 @@ fi
 write_fakes() {
   cat > "$FAKE_BIN/pg_dump" <<'EOF'
 #! /bin/sh
+if [ -n "${FAKE_PGPASS_LOG:-}" ]; then
+  printf 'PGPASSWORD=%s\nARGS=%s\n' "$PGPASSWORD" "$*" > "$FAKE_PGPASS_LOG"
+fi
+if [ "${FAKE_DUMP_EMPTY:-no}" = yes ]; then
+  exit 0
+fi
 echo "SELECT 1;"
 exit 0
 EOF
@@ -270,15 +279,34 @@ exit 0
 EOF
   cat > "$FAKE_BIN/pg_restore" <<'EOF'
 #! /bin/sh
+case " $* " in
+  *" --list "*)
+    if [ "${FAKE_RESTORE_LIST_FAIL:-no}" = yes ]; then
+      exit 1
+    fi
+    ;;
+esac
 exit 0
 EOF
-  cat > "$FAKE_BIN/psql" <<'EOF'
+  cat > "$FAKE_BIN/psql" <<EOF
 #! /bin/sh
-cat >/dev/null
-exit 0
+printf '%s\n' "\$*" >> "$WORKDIR/psql.log"
+case " \$* " in
+  *" -c "*)
+    case "\$*" in
+      *server_version_num*) echo "\${FAKE_PG_VERSION:-180000}" ;;
+      *"FROM pg_database"*) if [ "\${FAKE_DB_EXISTS:-no}" = yes ]; then echo 1; fi ;;
+      *"DROP DATABASE"*) if [ "\${FAKE_DROP_FAIL:-no}" = yes ]; then exit 1; fi ;;
+    esac
+    exit 0
+    ;;
+esac
+cat > "$WORKDIR/psql.stdin"
+exit "\${FAKE_PSQL_EXIT:-0}"
 EOF
   cat > "$FAKE_BIN/aws" <<EOF
 #! /bin/sh
+printf '%s\n' "\$*" >> "$WORKDIR/aws.log"
 cmd=""
 while [ "\$#" -gt 0 ]; do
   if [ "\$1" = s3 ]; then
@@ -290,16 +318,36 @@ while [ "\$#" -gt 0 ]; do
   shift
 done
 if [ "\$cmd" = cp ]; then
-  src=\$1
-  dest=\$2
+  # Options such as --storage-class come first; the last two arguments are the paths.
+  src=""
+  dest=""
+  for a in "\$@"; do
+    src=\$dest
+    dest=\$a
+  done
   if [ -f "\$src" ]; then
     rel=\${dest#s3://}
+    basename "\$dest" > "$WORKDIR/last-upload"
     mkdir -p "$WORKDIR/s3/\$(dirname "\$rel")"
     cp "\$src" "$WORKDIR/s3/\$rel"
     exit 0
   fi
   rel=\${src#s3://}
   cp "$WORKDIR/s3/\$rel" "\$dest"
+  exit 0
+fi
+if [ "\$cmd" = ls ]; then
+  cat "$WORKDIR/s3-ls.txt" 2>/dev/null
+  if [ "\${FAKE_LS_INCLUDE_UPLOAD:-no}" = yes ]; then
+    echo "2000-01-01 00:00:00 10 \$(cat "$WORKDIR/last-upload")"
+  fi
+  exit 0
+fi
+if [ "\$cmd" = rm ]; then
+  if [ "\${FAKE_RM_FAIL:-no}" = yes ]; then
+    exit 1
+  fi
+  printf '%s\n' "\$1" >> "$WORKDIR/aws-rm.log"
   exit 0
 fi
 exit 1
@@ -355,7 +403,7 @@ if (
   cd "$ROOT"
   PATH="$FAKE_BIN:$PATH"
   export PATH HOOK_DROP_PRIVS=no HOOK_INHERIT_ENV=no
-  bash "$ROOT/backup.sh"
+  $SCRIPT_SHELL "$ROOT/backup.sh"
 ); then
   pass
 else
@@ -384,7 +432,7 @@ if (
   PATH="$FAKE_BIN:$PATH"
   common_env
   export S3_BUCKET="**None**" HOOK_DROP_PRIVS=no
-  bash "$ROOT/backup.sh"
+  $SCRIPT_SHELL "$ROOT/backup.sh"
 ); then
   fail "backup.sh should fail without S3_BUCKET"
 else
@@ -409,7 +457,7 @@ if (
   PATH="$FAKE_BIN:$PATH"
   common_env
   export HOOK_DROP_PRIVS=no
-  bash "$ROOT/backup.sh"
+  $SCRIPT_SHELL "$ROOT/backup.sh"
 ); then
   fail "backup.sh should fail when pg_dump fails"
 else
@@ -436,7 +484,7 @@ if (
   PATH="$FAKE_BIN:$PATH"
   common_env
   export BACKUP_FILE=backup/appdb.sql.gz HOOK_DROP_PRIVS=no
-  bash "$ROOT/restore.sh"
+  $SCRIPT_SHELL "$ROOT/restore.sh"
 ); then
   pass
 else
@@ -450,7 +498,7 @@ if (
   PATH="$FAKE_BIN:$PATH"
   common_env
   export BACKUP_FILE="**None**" HOOK_DROP_PRIVS=no
-  bash "$ROOT/restore.sh"
+  $SCRIPT_SHELL "$ROOT/restore.sh"
 ); then
   fail "restore.sh should fail without BACKUP_FILE"
 else
@@ -461,6 +509,372 @@ if [ -f "$RESTORE_EVENTS" ]; then
 else
   pass
 fi
+
+# --- Phase 1 regression tests: env handling, S3 keys, restore safety ---
+
+rm -f "$HOOKS_DIR"/*
+export TMPDIR="$WORKDIR/tmp"
+mkdir -p "$TMPDIR"
+
+# run_script <script> [VAR=value ...] runs a script with the common env plus overrides.
+run_script() {
+  _script=$1
+  shift
+  (
+    cd "$ROOT" || exit 1
+    PATH="$FAKE_BIN:$PATH"
+    common_env
+    export HOOK_DROP_PRIVS=no HOOK_INHERIT_ENV=no
+    for _kv in "$@"; do
+      export "${_kv?}"
+    done
+    $SCRIPT_SHELL "$ROOT/$_script"
+  ) > "$WORKDIR/last.out" 2>&1
+}
+
+reset_logs() {
+  rm -rf "$WORKDIR/aws.log" "$WORKDIR/aws-rm.log" "$WORKDIR/psql.log" "$WORKDIR/psql.stdin" "$WORKDIR/s3-ls.txt" "$WORKDIR/s3/test-bucket"
+}
+
+last_upload_key() {
+  grep -E '(^| )s3 cp ' "$WORKDIR/aws.log" | tail -n 1 | awk '{print $NF}'
+}
+
+# Empty strings (as in the Kubernetes example) are treated as unset.
+reset_logs
+printf '2000-01-01 00:00:00 10 appdb_old.sql.gz\n' > "$WORKDIR/s3-ls.txt"
+if run_script backup.sh S3_ENDPOINT= DELETE_OLDER_THAN= ENCRYPTION_PASSWORD=; then
+  pass
+else
+  fail "backup.sh with empty optional vars should succeed"
+  cat "$WORKDIR/last.out" >&2
+fi
+if grep -q -- '--endpoint-url' "$WORKDIR/aws.log"; then
+  fail "empty S3_ENDPOINT produced --endpoint-url"
+else
+  pass
+fi
+if [ -f "$WORKDIR/aws-rm.log" ] || grep -qE '(^| )s3 ls ' "$WORKDIR/aws.log"; then
+  fail "empty DELETE_OLDER_THAN triggered retention"
+else
+  pass
+fi
+case "$(last_upload_key)" in
+  *.enc) fail "empty ENCRYPTION_PASSWORD encrypted the backup" ;;
+  *) pass ;;
+esac
+
+# Empty required variables are rejected.
+reset_logs
+assert_fail run_script backup.sh S3_BUCKET=
+assert_fail run_script backup.sh POSTGRES_PASSWORD=
+
+# Empty S3_PREFIX does not produce a double slash; slashes are normalised.
+reset_logs
+assert_ok run_script backup.sh S3_PREFIX=
+case "$(last_upload_key)" in
+  s3://test-bucket/appdb_*.sql.gz) pass ;;
+  *) fail "empty S3_PREFIX key: $(last_upload_key)" ;;
+esac
+reset_logs
+assert_ok run_script backup.sh S3_PREFIX=/nested/path/
+case "$(last_upload_key)" in
+  s3://test-bucket/nested/path/appdb_*.sql.gz) pass ;;
+  *) fail "slashed S3_PREFIX key: $(last_upload_key)" ;;
+esac
+
+# Invalid DELETE_OLDER_THAN fails before any dump or upload.
+reset_logs
+assert_fail run_script backup.sh "DELETE_OLDER_THAN=not a date at all"
+if [ -f "$WORKDIR/aws.log" ]; then
+  fail "invalid DELETE_OLDER_THAN still uploaded"
+else
+  pass
+fi
+
+# Retention uses the normalised prefix.
+reset_logs
+printf '2000-01-01 00:00:00 10 appdb_old.sql.gz\n' > "$WORKDIR/s3-ls.txt"
+assert_ok run_script backup.sh "DELETE_OLDER_THAN=30 days ago"
+assert_eq "$(cat "$WORKDIR/aws-rm.log" 2>/dev/null)" "s3://test-bucket/backup/appdb_old.sql.gz" "retention delete key"
+
+# Temporary files are removed after success and failure.
+assert_eq "$(ls "$TMPDIR" | wc -l | tr -d ' ')" "0" "temp dir cleaned"
+
+# Restore: plain SQL stops at the first error by default.
+reset_logs
+mkdir -p "$WORKDIR/s3/test-bucket/backup"
+printf 'SELECT 1;\n' | gzip > "$WORKDIR/s3/test-bucket/backup/appdb.sql.gz"
+assert_ok run_script restore.sh BACKUP_FILE=backup/appdb.sql.gz
+if grep -q 'ON_ERROR_STOP=1 -d appdb' "$WORKDIR/psql.log"; then
+  pass
+else
+  fail "restore psql missing ON_ERROR_STOP=1"
+  cat "$WORKDIR/psql.log" >&2
+fi
+
+RESTORE_EVENTS="$WORKDIR/restore.events"
+for ev in pre-restore post-restore restore-error; do
+  printf '#! /bin/sh\necho "$1" >> "%s"\n' "$RESTORE_EVENTS" > "$HOOKS_DIR/$ev"
+  chmod +x "$HOOKS_DIR/$ev"
+done
+rm -f "$RESTORE_EVENTS"
+assert_fail run_script restore.sh BACKUP_FILE=backup/appdb.sql.gz FAKE_PSQL_EXIT=3
+assert_eq "$(tr '\n' ' ' < "$RESTORE_EVENTS" | sed 's/ *$//')" "pre-restore restore-error" "failed psql restore fires restore-error"
+rm -f "$HOOKS_DIR"/*
+
+# RESTORE_ON_ERROR_STOP=no opts out; POSTGRES_DATABASE=all defaults to permissive.
+reset_logs
+mkdir -p "$WORKDIR/s3/test-bucket/backup"
+printf 'SELECT 1;\n' | gzip > "$WORKDIR/s3/test-bucket/backup/appdb.sql.gz"
+assert_ok run_script restore.sh BACKUP_FILE=backup/appdb.sql.gz RESTORE_ON_ERROR_STOP=no
+assert_ok run_script restore.sh BACKUP_FILE=backup/appdb.sql.gz POSTGRES_DATABASE=all
+if grep -v ' -c ' "$WORKDIR/psql.log" | grep -q 'ON_ERROR_STOP'; then
+  fail "ON_ERROR_STOP set despite opt-out / all"
+else
+  pass
+fi
+assert_fail run_script restore.sh BACKUP_FILE=backup/appdb.sql.gz RESTORE_ON_ERROR_STOP=maybe
+
+# A failed DROP DATABASE fails the restore instead of restoring into the old database.
+reset_logs
+mkdir -p "$WORKDIR/s3/test-bucket/backup"
+printf 'SELECT 1;\n' | gzip > "$WORKDIR/s3/test-bucket/backup/appdb.sql.gz"
+assert_fail run_script restore.sh BACKUP_FILE=backup/appdb.sql.gz DROP_DATABASE=yes FAKE_DROP_FAIL=yes
+if [ -f "$WORKDIR/psql.stdin" ]; then
+  fail "restore ran after failed DROP DATABASE"
+else
+  pass
+fi
+
+# DROP uses WITH (FORCE) on PostgreSQL 13+ and plain DROP before that.
+reset_logs
+mkdir -p "$WORKDIR/s3/test-bucket/backup"
+printf 'SELECT 1;\n' | gzip > "$WORKDIR/s3/test-bucket/backup/appdb.sql.gz"
+assert_ok run_script restore.sh BACKUP_FILE=backup/appdb.sql.gz DROP_DATABASE=yes
+if grep -q 'DROP DATABASE IF EXISTS "appdb" WITH (FORCE);' "$WORKDIR/psql.log"; then pass; else fail "missing DROP WITH (FORCE)"; fi
+assert_ok run_script restore.sh BACKUP_FILE=backup/appdb.sql.gz DROP_DATABASE=yes FAKE_PG_VERSION=120005
+if grep -q 'DROP DATABASE IF EXISTS "appdb";' "$WORKDIR/psql.log"; then pass; else fail "missing plain DROP for PostgreSQL 12"; fi
+
+# CREATE_DATABASE only creates a missing database.
+reset_logs
+mkdir -p "$WORKDIR/s3/test-bucket/backup"
+printf 'SELECT 1;\n' | gzip > "$WORKDIR/s3/test-bucket/backup/appdb.sql.gz"
+assert_ok run_script restore.sh BACKUP_FILE=backup/appdb.sql.gz CREATE_DATABASE=yes FAKE_DB_EXISTS=yes
+if grep -q 'CREATE DATABASE' "$WORKDIR/psql.log"; then fail "CREATE DATABASE run for existing database"; else pass; fi
+assert_ok run_script restore.sh BACKUP_FILE=backup/appdb.sql.gz CREATE_DATABASE=yes
+if grep -q 'CREATE DATABASE "appdb";' "$WORKDIR/psql.log"; then pass; else fail "CREATE DATABASE not run for missing database"; fi
+
+# Invalid PARALLEL_JOBS is rejected up front.
+assert_fail run_script restore.sh BACKUP_FILE=backup/appdb.sql.gz PARALLEL_JOBS=abc
+
+# Unsupported formats are rejected before the database is dropped.
+reset_logs
+mkdir -p "$WORKDIR/s3/test-bucket/backup"
+printf 'x' > "$WORKDIR/s3/test-bucket/backup/appdb.tar"
+assert_fail run_script restore.sh BACKUP_FILE=backup/appdb.tar DROP_DATABASE=yes
+if grep -q 'DROP' "$WORKDIR/psql.log" 2>/dev/null; then fail "dropped database before rejecting format"; else pass; fi
+
+assert_eq "$(ls "$TMPDIR" | wc -l | tr -d ' ')" "0" "temp dir cleaned after restores"
+
+# run.sh: empty SCHEDULE runs a one-off backup instead of go-cron.
+RUN_DIR="$WORKDIR/run"
+mkdir -p "$RUN_DIR"
+printf 'echo BACKUP\n' > "$RUN_DIR/backup.sh"
+printf 'echo RESTORE\n' > "$RUN_DIR/restore.sh"
+printf '#! /bin/sh\necho GOCRON "$@"\n' > "$FAKE_BIN/go-cron"
+printf '#! /bin/sh\nexit 0\n' > "$FAKE_BIN/update-ca-certificates"
+chmod +x "$FAKE_BIN/go-cron" "$FAKE_BIN/update-ca-certificates"
+run_entry() {
+  (
+    cd "$RUN_DIR" || exit 1
+    PATH="$FAKE_BIN:$PATH"
+    export BACKUP_FILE="$1" SCHEDULE="$2" S3_S3V4=no S3_CA_BUNDLE=
+    sh "$ROOT/run.sh"
+  ) 2>&1
+}
+assert_eq "$(run_entry '' '')" "GOCRON --once /bin/sh backup.sh" "run.sh empty SCHEDULE"
+assert_eq "$(run_entry '**None**' '@daily')" "GOCRON @daily /bin/sh backup.sh" "run.sh with SCHEDULE"
+assert_eq "$(run_entry 'backup/x.sql.gz' '@daily')" "GOCRON --once /bin/sh restore.sh" "run.sh with BACKUP_FILE"
+unset TMPDIR
+
+# --- Phase 2: retention options and dump verification ---
+
+export TMPDIR="$WORKDIR/tmp"
+
+write_old_listing() {
+  cat > "$WORKDIR/s3-ls.txt" <<LS
+                           PRE nested/
+2000-01-01 00:00:00         10 appdb_2000-01-01T00:00:00Z.sql.gz
+2000-01-01 00:00:00         10 otherdb_2000-01-01T00:00:00Z.sql.gz
+2000-01-01 00:00:00         10 notes with spaces.txt
+2999-01-01 00:00:00         10 appdb_2999-01-01T00:00:00Z.sql.gz
+LS
+}
+
+# Default retention keeps the current behaviour: every old file in the prefix is deleted.
+reset_logs
+write_old_listing
+assert_ok run_script backup.sh "DELETE_OLDER_THAN=30 days ago"
+assert_eq "$(sort "$WORKDIR/aws-rm.log" | tr '\n' '|')" "s3://test-bucket/backup/appdb_2000-01-01T00:00:00Z.sql.gz|s3://test-bucket/backup/notes with spaces.txt|s3://test-bucket/backup/otherdb_2000-01-01T00:00:00Z.sql.gz|" "default retention deletes all old files"
+if grep -q 'Retention: deleted 3 file(s), kept 1 newer file(s)' "$WORKDIR/last.out"; then pass; else fail "retention summary missing"; fi
+
+# DELETE_MATCH_DATABASE=yes only deletes this database's backups.
+reset_logs
+write_old_listing
+assert_ok run_script backup.sh "DELETE_OLDER_THAN=30 days ago" DELETE_MATCH_DATABASE=yes
+assert_eq "$(cat "$WORKDIR/aws-rm.log")" "s3://test-bucket/backup/appdb_2000-01-01T00:00:00Z.sql.gz" "DELETE_MATCH_DATABASE=yes deletes only matching files"
+
+# The backup uploaded by this run is never deleted, even if its listed time is old.
+reset_logs
+assert_ok run_script backup.sh "DELETE_OLDER_THAN=30 days ago" FAKE_LS_INCLUDE_UPLOAD=yes
+if [ -f "$WORKDIR/aws-rm.log" ]; then
+  fail "retention deleted the backup it just uploaded: $(cat "$WORKDIR/aws-rm.log")"
+else
+  pass
+fi
+
+# A failed delete fails the backup.
+reset_logs
+write_old_listing
+assert_fail run_script backup.sh "DELETE_OLDER_THAN=30 days ago" FAKE_RM_FAIL=yes
+
+# An empty dump is never uploaded.
+reset_logs
+assert_fail run_script backup.sh USE_CUSTOM_FORMAT=yes FAKE_DUMP_EMPTY=yes
+if [ -f "$WORKDIR/aws.log" ]; then fail "empty dump was uploaded"; else pass; fi
+
+# A custom-format dump that pg_restore cannot read is never uploaded.
+reset_logs
+assert_fail run_script backup.sh USE_CUSTOM_FORMAT=yes FAKE_RESTORE_LIST_FAIL=yes
+if [ -f "$WORKDIR/aws.log" ]; then fail "unreadable custom dump was uploaded"; else pass; fi
+reset_logs
+assert_ok run_script backup.sh USE_CUSTOM_FORMAT=yes
+
+# A corrupt gzip stream is never uploaded.
+GZ_BIN="$WORKDIR/gzbin"
+mkdir -p "$GZ_BIN"
+REAL_GZIP=$(command -v gzip)
+cat > "$GZ_BIN/gzip" <<GZ
+#! /bin/sh
+if [ "\$1" = -t ]; then
+  exec "$REAL_GZIP" "\$@"
+fi
+cat >/dev/null
+printf 'not gzip data'
+GZ
+chmod +x "$GZ_BIN/gzip"
+reset_logs
+assert_fail run_script backup.sh "PATH=$GZ_BIN:$FAKE_BIN:$PATH"
+if [ -f "$WORKDIR/aws.log" ]; then fail "corrupt gzip dump was uploaded"; else pass; fi
+
+# Other compressors are not checked with gzip -t.
+reset_logs
+assert_ok run_script backup.sh COMPRESSION_CMD=cat
+
+assert_eq "$(ls "$TMPDIR" | wc -l | tr -d ' ')" "0" "temp dir cleaned after phase 2 tests"
+unset TMPDIR
+
+# --- Phase 3: secrets from files, restore latest, upload options, BACKUP_ON_START ---
+
+export TMPDIR="$WORKDIR/tmp"
+SECRETS="$WORKDIR/secrets"
+mkdir -p "$SECRETS"
+printf 'filepass\n' > "$SECRETS/pgpass"
+printf 'fileuser\n' > "$SECRETS/pguser"
+printf 'encpass\n' > "$SECRETS/encpass"
+
+# *_FILE secrets are loaded, with the trailing newline removed.
+reset_logs
+assert_ok run_script backup.sh POSTGRES_PASSWORD='**None**' "POSTGRES_PASSWORD_FILE=$SECRETS/pgpass" POSTGRES_USER= "POSTGRES_USER_FILE=$SECRETS/pguser" "FAKE_PGPASS_LOG=$WORKDIR/pgpass.log"
+if grep -q '^PGPASSWORD=filepass$' "$WORKDIR/pgpass.log" && grep -q '^ARGS=.* -U fileuser ' "$WORKDIR/pgpass.log"; then
+  pass
+else
+  fail "POSTGRES_PASSWORD_FILE/POSTGRES_USER_FILE not used: $(cat "$WORKDIR/pgpass.log")"
+fi
+
+# Setting both a variable and its _FILE form is rejected, as is an unreadable file.
+assert_fail run_script backup.sh "POSTGRES_PASSWORD_FILE=$SECRETS/pgpass"
+assert_fail run_script backup.sh POSTGRES_PASSWORD= "POSTGRES_PASSWORD_FILE=$SECRETS/missing"
+
+# ENCRYPTION_PASSWORD_FILE encrypts with the file's password.
+reset_logs
+assert_ok run_script backup.sh "ENCRYPTION_PASSWORD_FILE=$SECRETS/encpass"
+ENC_KEY=$(last_upload_key)
+ENC_OBJ="$WORKDIR/s3/${ENC_KEY#s3://}"
+case "$ENC_KEY" in
+  *.sql.gz.enc) pass ;;
+  *) fail "ENCRYPTION_PASSWORD_FILE did not encrypt: $ENC_KEY" ;;
+esac
+if openssl enc -aes-256-cbc -d -pbkdf2 -iter 100000 -in "$ENC_OBJ" -pass pass:encpass 2>/dev/null | gunzip -c | grep -q 'SELECT 1;'; then
+  pass
+else
+  fail "backup not decryptable with the password from ENCRYPTION_PASSWORD_FILE"
+fi
+
+# BACKUP_FILE=latest restores the newest matching backup.
+reset_logs
+mkdir -p "$WORKDIR/s3/test-bucket/backup"
+cat > "$WORKDIR/s3-ls.txt" <<LS
+                           PRE nested/
+2030-01-01 00:00:00         10 appdb_2024-01-01T00:00:00Z.sql.gz
+2020-01-01 00:00:00         10 appdb_2025-06-01T12:00:00Z.dump
+2020-01-01 00:00:00         10 appdb_2025-01-01T00:00:00Z.sql.gz.enc
+2020-01-01 00:00:00         10 appdb_archive_2026-01-01T00:00:00Z.sql.gz
+2020-01-01 00:00:00         10 otherdb_2026-01-01T00:00:00Z.sql.gz
+2020-01-01 00:00:00         10 appdb_notes.txt
+LS
+printf 'custom' > "$WORKDIR/s3/test-bucket/backup/appdb_2025-06-01T12:00:00Z.dump"
+PRE_RESTORE_ENV="$WORKDIR/pre-restore.env"
+printf '#! /bin/sh\nenv > "%s"\n' "$PRE_RESTORE_ENV" > "$HOOKS_DIR/pre-restore"
+chmod +x "$HOOKS_DIR/pre-restore"
+assert_ok run_script restore.sh BACKUP_FILE=latest
+if grep -q 's3 cp s3://test-bucket/backup/appdb_2025-06-01T12:00:00Z.dump ' "$WORKDIR/aws.log"; then
+  pass
+else
+  fail "BACKUP_FILE=latest picked the wrong file:"
+  cat "$WORKDIR/aws.log" "$WORKDIR/last.out" >&2
+fi
+if grep -q '^BACKUP_FILE=backup/appdb_2025-06-01T12:00:00Z.dump$' "$PRE_RESTORE_ENV"; then
+  pass
+else
+  fail "pre-restore hook did not see the resolved BACKUP_FILE"
+fi
+rm -f "$HOOKS_DIR"/*
+
+# BACKUP_FILE=latest with an empty prefix and with no matching backups.
+reset_logs
+mkdir -p "$WORKDIR/s3/test-bucket"
+printf '2020-01-01 00:00:00         10 appdb_2025-06-01T12:00:00Z.dump\n' > "$WORKDIR/s3-ls.txt"
+printf 'custom' > "$WORKDIR/s3/test-bucket/appdb_2025-06-01T12:00:00Z.dump"
+assert_ok run_script restore.sh BACKUP_FILE=latest S3_PREFIX=
+if grep -q 's3 cp s3://test-bucket/appdb_2025-06-01T12:00:00Z.dump ' "$WORKDIR/aws.log"; then pass; else fail "latest with empty prefix"; fi
+reset_logs
+printf '2020-01-01 00:00:00         10 otherdb_2025-06-01T12:00:00Z.dump\n' > "$WORKDIR/s3-ls.txt"
+assert_fail run_script restore.sh BACKUP_FILE=latest
+if grep -q 'No backups of appdb found' "$WORKDIR/last.out"; then pass; else fail "missing no-backups message"; fi
+
+# Upload options are passed to the upload only.
+reset_logs
+assert_ok run_script backup.sh S3_STORAGE_CLASS=STANDARD_IA S3_SSE=aws:kms S3_SSE_KMS_KEY_ID=alias/backups
+if grep -qE '(^| )s3 cp --storage-class STANDARD_IA --sse aws:kms --sse-kms-key-id alias/backups ' "$WORKDIR/aws.log"; then
+  pass
+else
+  fail "upload options missing: $(cat "$WORKDIR/aws.log")"
+fi
+case "$(last_upload_key)" in
+  s3://test-bucket/backup/appdb_*.sql.gz) pass ;;
+  *) fail "upload key with options: $(last_upload_key)" ;;
+esac
+assert_fail run_script backup.sh S3_SSE=rot13
+assert_fail run_script backup.sh S3_SSE_KMS_KEY_ID=alias/backups
+
+# BACKUP_ON_START asks go-cron to run a backup before the first scheduled run.
+assert_eq "$(BACKUP_ON_START=yes run_entry '**None**' '@daily')" "GOCRON --run-on-start @daily /bin/sh backup.sh" "BACKUP_ON_START=yes"
+assert_eq "$(BACKUP_ON_START=no run_entry '**None**' '@daily')" "GOCRON @daily /bin/sh backup.sh" "BACKUP_ON_START=no"
+
+assert_eq "$(ls "$TMPDIR" | wc -l | tr -d ' ')" "0" "temp dir cleaned after phase 3 tests"
+unset TMPDIR
 
 echo "Passed: $PASS  Failed: $FAIL"
 if [ "$FAIL" -ne 0 ]; then
