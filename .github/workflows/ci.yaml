@@ -16,8 +16,14 @@ jobs:
       - name: Check out the repo
         uses: actions/checkout@v5
 
+      # The runner's ShellCheck is too old for the busybox dialect, so pin a newer one.
+      - name: Install ShellCheck
+        run: |
+          python3 -m venv "$RUNNER_TEMP/shellcheck"
+          "$RUNNER_TEMP/shellcheck/bin/pip" install --quiet shellcheck-py==0.11.0.1
+
       - name: ShellCheck
-        run: shellcheck -s busybox -S warning *.sh test/*.sh
+        run: '"$RUNNER_TEMP/shellcheck/bin/shellcheck" -s busybox -S warning *.sh test/*.sh'
 
       - name: Run tests
         run: sh test/hooks_test.sh
