@@ -5,116 +5,74 @@ set -o pipefail
 
 >&2 echo "-----"
 
-quote_ident() {
-  printf '"%s"' "$(printf '%s' "$1" | sed 's/"/""/g')"
-}
-
-has_value() {
-  [ -n "$1" ] && [ "$1" != "**None**" ]
-}
-
+. "$(dirname "$0")/common.sh"
 . "$(dirname "$0")/hooks.sh"
 
-cleanup() {
-  if [ -n "$ENCRYPTED_PATH" ] || [ -n "$DECRYPTED_PATH" ] || [ -n "$DOWNLOAD_PATH" ]; then
-    echo "Cleaning up temporary files"
-  fi
-  if [ -n "$ENCRYPTED_PATH" ]; then
-    rm -f "$ENCRYPTED_PATH"
-  fi
-  if [ -n "$DECRYPTED_PATH" ]; then
-    rm -f "$DECRYPTED_PATH"
-  fi
-  if [ -n "$DOWNLOAD_PATH" ]; then
-    rm -f "$DOWNLOAD_PATH"
-  fi
-}
+validate_common_env
 
-if [ "${S3_BUCKET}" = "**None**" ]; then
-  echo "You need to set the S3_BUCKET environment variable."
-  exit 1
-fi
-
-if [ "${POSTGRES_DATABASE}" = "**None**" ]; then
-  echo "You need to set the POSTGRES_DATABASE environment variable."
-  exit 1
-fi
-
-if [ "${POSTGRES_HOST}" = "**None**" ]; then
-  if [ -n "${POSTGRES_PORT_5432_TCP_ADDR}" ]; then
-    POSTGRES_HOST=$POSTGRES_PORT_5432_TCP_ADDR
-    POSTGRES_PORT=$POSTGRES_PORT_5432_TCP_PORT
-  else
-    echo "You need to set the POSTGRES_HOST environment variable."
-    exit 1
-  fi
-fi
-
-if [ "${POSTGRES_USER}" = "**None**" ]; then
-  echo "You need to set the POSTGRES_USER environment variable."
-  exit 1
-fi
-
-if [ "${POSTGRES_PASSWORD}" = "**None**" ]; then
-  echo "You need to set the POSTGRES_PASSWORD environment variable or link to a container named POSTGRES."
-  exit 1
-fi
-
-if has_value "${S3_ACCESS_KEY_ID}"; then
-  if ! has_value "${S3_SECRET_ACCESS_KEY}"; then
-    echo "You need to set the S3_SECRET_ACCESS_KEY environment variable."
-    exit 1
-  fi
-  export AWS_ACCESS_KEY_ID=$S3_ACCESS_KEY_ID
-  export AWS_SECRET_ACCESS_KEY=$S3_SECRET_ACCESS_KEY
-elif has_value "${S3_SECRET_ACCESS_KEY}"; then
-  echo "You need to set the S3_ACCESS_KEY_ID environment variable."
-  exit 1
-fi
-
-if [ "${S3_ENDPOINT}" = "**None**" ]; then
-  AWS_ARGS=""
-else
-  AWS_ARGS="--endpoint-url ${S3_ENDPOINT}"
-fi
-
-if [ "${S3_SSL_VERIFY}" = "no" ]; then
-  AWS_ARGS="$AWS_ARGS --no-verify-ssl"
-fi
-
-if [ "${BACKUP_FILE}" = "**None**" ]; then
+if ! has_value "${BACKUP_FILE}"; then
   echo "You need to set the BACKUP_FILE environment variable with the backup filename to restore."
   echo "Use S3_PREFIX/filename format. Example: backup/database_0000-00-00T00:00:00Z.sql.gz"
   exit 1
 fi
 
-# Avoid AWS CLI v2 default checksum behaviour that breaks many S3-compatible
-# endpoints and some streaming uploads (XAmzContentSHA256Mismatch).
-export AWS_REQUEST_CHECKSUM_CALCULATION="${AWS_REQUEST_CHECKSUM_CALCULATION:-when_required}"
-export AWS_RESPONSE_CHECKSUM_VALIDATION="${AWS_RESPONSE_CHECKSUM_VALIDATION:-when_required}"
+if has_value "${PARALLEL_JOBS}"; then
+  is_positive_int "$PARALLEL_JOBS" || die "PARALLEL_JOBS must be a positive integer, got: ${PARALLEL_JOBS}"
+else
+  PARALLEL_JOBS=1
+fi
 
-export AWS_DEFAULT_REGION=$S3_REGION
+# Stop plain-SQL restores at the first error so a partial restore is never
+# reported as a success. pg_dumpall output routinely hits harmless errors
+# (for example "role already exists"), so it stays permissive unless asked.
+if has_value "${RESTORE_ON_ERROR_STOP}"; then
+  case "$RESTORE_ON_ERROR_STOP" in
+    yes|no) ;;
+    *) die "RESTORE_ON_ERROR_STOP must be yes or no, got: ${RESTORE_ON_ERROR_STOP}" ;;
+  esac
+elif [ "${POSTGRES_DATABASE}" = "all" ]; then
+  RESTORE_ON_ERROR_STOP=no
+else
+  RESTORE_ON_ERROR_STOP=yes
+fi
 
-export PGPASSWORD=$POSTGRES_PASSWORD
-POSTGRES_HOST_OPTS="-h $POSTGRES_HOST -p $POSTGRES_PORT -U $POSTGRES_USER $POSTGRES_EXTRA_OPTS"
+setup_aws
+setup_postgres
 POSTGRES_DATABASE_IDENT=$(quote_ident "$POSTGRES_DATABASE")
+POSTGRES_DATABASE_LITERAL=$(quote_literal "$POSTGRES_DATABASE")
 
-LOCAL_FILE=$(basename "$BACKUP_FILE")
-DOWNLOAD_PATH="/tmp/$LOCAL_FILE"
-ENCRYPTED_PATH=""
-DECRYPTED_PATH=""
+PSQL_RESTORE_OPTS=""
+if [ "$RESTORE_ON_ERROR_STOP" = "yes" ]; then
+  PSQL_RESTORE_OPTS="-v ON_ERROR_STOP=1"
+fi
+
+# Runs a single admin statement against the postgres database and fails on error.
+psql_admin() {
+  psql $POSTGRES_HOST_OPTS -d postgres -v ON_ERROR_STOP=1 -Atq -c "$1"
+}
 
 restore_on_exit() {
   rc=$?
   trap - EXIT
   set +e
-  cleanup
+  if [ -n "$WORK_DIR" ]; then
+    echo "Cleaning up temporary files"
+  fi
+  remove_work_dir
   if [ "$rc" -ne 0 ]; then
     run_error_hooks restore-error "$rc"
   fi
   exit "$rc"
 }
 trap restore_on_exit EXIT
+# Turn SIGTERM/SIGINT into a normal exit so the EXIT trap cleans up and fires error hooks.
+trap 'exit 143' TERM
+trap 'exit 130' INT
+
+make_work_dir
+
+LOCAL_FILE=$(basename "$BACKUP_FILE")
+DOWNLOAD_PATH="$WORK_DIR/$LOCAL_FILE"
 
 run_hooks pre-restore
 
@@ -123,7 +81,7 @@ aws $AWS_ARGS s3 cp "s3://${S3_BUCKET}/${BACKUP_FILE}" "$DOWNLOAD_PATH" || exit 
 
 case "$LOCAL_FILE" in
   *.enc)
-    if [ "${ENCRYPTION_PASSWORD}" = "**None**" ]; then
+    if ! has_value "${ENCRYPTION_PASSWORD}"; then
       echo "Backup file is encrypted. You need to set the ENCRYPTION_PASSWORD environment variable."
       exit 1
     fi
@@ -139,7 +97,16 @@ case "$LOCAL_FILE" in
       fi
       echo "WARNING: Decrypted legacy OpenSSL backup (non-PBKDF2). Re-backup to upgrade encryption."
     fi
+    rm -f "$ENCRYPTED_PATH"
     DOWNLOAD_PATH=$DECRYPTED_PATH
+    ;;
+esac
+
+case "$DOWNLOAD_PATH" in
+  *.sql.gz|*.dump) ;;
+  *)
+    echo "ERROR: Unsupported backup format. Expected *.sql.gz or *.dump file."
+    exit 1
     ;;
 esac
 
@@ -151,10 +118,15 @@ if [ "${DROP_DATABASE}" = "yes" ]; then
     exit 1
   fi
   echo "Dropping database ${POSTGRES_DATABASE}"
-  if ! psql $POSTGRES_HOST_OPTS -d postgres -c "DROP DATABASE IF EXISTS ${POSTGRES_DATABASE_IDENT} WITH (FORCE);" > /dev/null 2>&1; then
-    if ! psql $POSTGRES_HOST_OPTS -d postgres -c "DROP DATABASE IF EXISTS ${POSTGRES_DATABASE_IDENT};" > /dev/null 2>&1; then
-      echo "WARNING: Failed to drop database ${POSTGRES_DATABASE}."
-    fi
+  server_version_num=$(psql_admin "SHOW server_version_num")
+  if [ "$server_version_num" -ge 130000 ]; then
+    drop_sql="DROP DATABASE IF EXISTS ${POSTGRES_DATABASE_IDENT} WITH (FORCE);"
+  else
+    drop_sql="DROP DATABASE IF EXISTS ${POSTGRES_DATABASE_IDENT};"
+  fi
+  if ! psql_admin "$drop_sql"; then
+    echo "ERROR: Failed to drop database ${POSTGRES_DATABASE}."
+    exit 1
   fi
 fi
 
@@ -163,9 +135,15 @@ if [ "${CREATE_DATABASE}" = "yes" ]; then
     echo "Cannot create all databases. Please specify a single database to create."
     exit 1
   fi
-  echo "Creating database ${POSTGRES_DATABASE}"
-  if ! psql $POSTGRES_HOST_OPTS -d postgres -c "CREATE DATABASE ${POSTGRES_DATABASE_IDENT};" > /dev/null 2>&1; then
-    echo "WARNING: Failed to create database ${POSTGRES_DATABASE}. It might already exist."
+  db_exists=$(psql_admin "SELECT 1 FROM pg_database WHERE datname = ${POSTGRES_DATABASE_LITERAL}")
+  if [ "$db_exists" = "1" ]; then
+    echo "Database ${POSTGRES_DATABASE} already exists; not creating it"
+  else
+    echo "Creating database ${POSTGRES_DATABASE}"
+    if ! psql_admin "CREATE DATABASE ${POSTGRES_DATABASE_IDENT};"; then
+      echo "ERROR: Failed to create database ${POSTGRES_DATABASE}."
+      exit 1
+    fi
   fi
 fi
 
@@ -173,29 +151,24 @@ case "$DOWNLOAD_PATH" in
   *.sql.gz)
     if [ "${POSTGRES_DATABASE}" = "all" ]; then
       echo "Restoring all databases"
-      $DECOMPRESSION_CMD "$DOWNLOAD_PATH" | psql $POSTGRES_HOST_OPTS -d postgres
+      $DECOMPRESSION_CMD "$DOWNLOAD_PATH" | psql $POSTGRES_HOST_OPTS $PSQL_RESTORE_OPTS -d postgres
     else
       echo "Restoring database ${POSTGRES_DATABASE}"
-      $DECOMPRESSION_CMD "$DOWNLOAD_PATH" | psql $POSTGRES_HOST_OPTS -d "$POSTGRES_DATABASE"
+      $DECOMPRESSION_CMD "$DOWNLOAD_PATH" | psql $POSTGRES_HOST_OPTS $PSQL_RESTORE_OPTS -d "$POSTGRES_DATABASE"
     fi
     ;;
   *.dump)
     if [ "${POSTGRES_DATABASE}" = "all" ]; then
       echo "ERROR: Custom format backup cannot be used to restore all databases."
       exit 1
-    else
-      echo "Restoring database ${POSTGRES_DATABASE} from custom format"
-      if [ "$PARALLEL_JOBS" -gt 1 ]; then
-        echo "Using parallel restore with $PARALLEL_JOBS jobs"
-        pg_restore -j "$PARALLEL_JOBS" $POSTGRES_HOST_OPTS -d "$POSTGRES_DATABASE" "$DOWNLOAD_PATH"
-      else
-        pg_restore $POSTGRES_HOST_OPTS -d "$POSTGRES_DATABASE" "$DOWNLOAD_PATH"
-      fi
     fi
-    ;;
-  *)
-    echo "ERROR: Unsupported backup format. Expected *.sql.gz or *.dump file."
-    exit 1
+    echo "Restoring database ${POSTGRES_DATABASE} from custom format"
+    if [ "$PARALLEL_JOBS" -gt 1 ]; then
+      echo "Using parallel restore with $PARALLEL_JOBS jobs"
+      pg_restore -j "$PARALLEL_JOBS" $POSTGRES_HOST_OPTS -d "$POSTGRES_DATABASE" "$DOWNLOAD_PATH"
+    else
+      pg_restore $POSTGRES_HOST_OPTS -d "$POSTGRES_DATABASE" "$DOWNLOAD_PATH"
+    fi
     ;;
 esac
 
