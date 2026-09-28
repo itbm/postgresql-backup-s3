@@ -1,5 +1,7 @@
 #! /bin/sh
 # Shared validation and setup for backup.sh and restore.sh. Sourced, not executed.
+# Variables set here (AWS_ARGS, S3_BASE_URI, ...) are used by the scripts that source this file.
+# shellcheck disable=SC2034
 
 # A value is set when it is non-empty and not the **None** placeholder.
 has_value() {
