@@ -101,3 +101,22 @@ func TestLineWriter(t *testing.T) {
 		t.Errorf("Flush left %q", w.buf)
 	}
 }
+
+func TestExitCode(t *testing.T) {
+	var out captureWriter
+	if got := exitCode(nil); got != 0 {
+		t.Errorf("exitCode(nil) = %d, want 0", got)
+	}
+	err := runCommand(context.Background(), "/bin/sh", []string{"-c", "exit 3"}, 0, time.Second, &out, &out)
+	if got := exitCode(err); got != 3 {
+		t.Errorf("exitCode(exit 3) = %d, want 3", got)
+	}
+	err = runCommand(context.Background(), "/bin/sh", []string{"-c", "kill -KILL $$"}, 0, time.Second, &out, &out)
+	if got := exitCode(err); got != 137 {
+		t.Errorf("exitCode(SIGKILL) = %d, want 137", got)
+	}
+	err = runCommand(context.Background(), "/nonexistent/command", nil, 0, time.Second, &out, &out)
+	if got := exitCode(err); got != 1 {
+		t.Errorf("exitCode(start failure) = %d, want 1", got)
+	}
+}

@@ -145,15 +145,72 @@ func runCommand(ctx context.Context, command string, args []string, timeout, gra
 	return err
 }
 
+const usage = `Usage:
+  go-cron [--run-on-start] <schedule> <command> [args...]
+  go-cron --once <command> [args...]`
+
+// exitCode maps a runCommand error to a process exit code.
+func exitCode(err error) int {
+	if err == nil {
+		return 0
+	}
+	var exitErr *exec.ExitError
+	if errors.As(err, &exitErr) {
+		if status, ok := exitErr.Sys().(syscall.WaitStatus); ok && status.Signaled() {
+			return 128 + int(status.Signal())
+		}
+		if code := exitErr.ExitCode(); code > 0 {
+			return code
+		}
+	}
+	return 1
+}
+
+// runOnce runs command a single time, passing its output through unchanged,
+// and forwards SIGTERM/SIGINT to its whole process group.
+func runOnce(command string, args []string) int {
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
+	defer stop()
+	err := runCommand(ctx, command, args, 0, killGrace, os.Stdout, os.Stderr)
+	if err != nil && ctx.Err() != nil {
+		fmt.Fprintf(os.Stderr, "%v\n", err)
+	}
+	return exitCode(err)
+}
+
 func main() {
-	if len(os.Args) < 3 {
-		fmt.Println("Usage: go-cron <schedule> <command> [args...]")
+	argv := os.Args[1:]
+	once := false
+	runOnStart := false
+	for len(argv) > 0 && strings.HasPrefix(argv[0], "--") {
+		switch argv[0] {
+		case "--once":
+			once = true
+		case "--run-on-start":
+			runOnStart = true
+		default:
+			fmt.Println(usage)
+			os.Exit(1)
+		}
+		argv = argv[1:]
+	}
+
+	if once {
+		if len(argv) < 1 || runOnStart {
+			fmt.Println(usage)
+			os.Exit(1)
+		}
+		os.Exit(runOnce(argv[0], argv[1:]))
+	}
+
+	if len(argv) < 2 {
+		fmt.Println(usage)
 		os.Exit(1)
 	}
 
-	schedule := os.Args[1]
-	command := os.Args[2]
-	args := os.Args[3:]
+	schedule := argv[0]
+	command := argv[1]
+	args := argv[2:]
 
 	// Validate schedule
 	if err := validateSchedule(schedule); err != nil {
@@ -179,7 +236,7 @@ func main() {
 	c := cron.New()
 	var mu sync.Mutex
 
-	_, err = c.AddFunc(schedule, func() {
+	job := func() {
 		if ctx.Err() != nil {
 			return
 		}
@@ -202,8 +259,9 @@ func main() {
 		} else {
 			timestampedPrint("INFO", "Command finished successfully\n")
 		}
-	})
+	}
 
+	_, err = c.AddFunc(schedule, job)
 	if err != nil {
 		timestampedPrint("ERROR", fmt.Sprintf("Error adding cron job: %v\n", err))
 		os.Exit(1)
@@ -218,10 +276,16 @@ func main() {
 	}
 
 	c.Start()
+	if runOnStart {
+		timestampedPrint("INFO", "Running command once before the first scheduled run\n")
+		go job()
+	}
 	<-ctx.Done()
 	stop()
 
 	timestampedPrint("INFO", "Shutdown signal received; waiting for any running command to stop\n")
 	<-c.Stop().Done()
+	// Also wait for a run started by --run-on-start, which cron does not track.
+	mu.Lock()
 	timestampedPrint("INFO", "Shutdown complete\n")
 }

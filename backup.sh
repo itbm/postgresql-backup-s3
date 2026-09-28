@@ -46,6 +46,25 @@ if has_value "${DELETE_OLDER_THAN}"; then
   fi
 fi
 
+UPLOAD_ARGS=""
+if has_value "${S3_STORAGE_CLASS}"; then
+  UPLOAD_ARGS="--storage-class ${S3_STORAGE_CLASS}"
+fi
+if has_value "${S3_SSE}"; then
+  case "$S3_SSE" in
+    AES256|aws:kms|aws:kms:dsse) ;;
+    *) die "S3_SSE must be AES256, aws:kms or aws:kms:dsse, got: ${S3_SSE}" ;;
+  esac
+  UPLOAD_ARGS="$UPLOAD_ARGS --sse ${S3_SSE}"
+fi
+if has_value "${S3_SSE_KMS_KEY_ID}"; then
+  case "${S3_SSE}" in
+    aws:kms|aws:kms:dsse) ;;
+    *) die "S3_SSE_KMS_KEY_ID requires S3_SSE=aws:kms or S3_SSE=aws:kms:dsse." ;;
+  esac
+  UPLOAD_ARGS="$UPLOAD_ARGS --sse-kms-key-id ${S3_SSE_KMS_KEY_ID}"
+fi
+
 setup_aws
 setup_postgres
 POSTGRES_DUMP_OPTS="$POSTGRES_EXTRA_DUMP_OPTS"
@@ -112,7 +131,7 @@ fi
 
 echo "Uploading dump to $S3_BUCKET"
 
-aws $AWS_ARGS s3 cp "$SRC_FILE" "$BACKUP_S3_URI" || exit 2
+aws $AWS_ARGS s3 cp $UPLOAD_ARGS "$SRC_FILE" "$BACKUP_S3_URI" || exit 2
 rm -f "$SRC_FILE"
 
 if has_value "${DELETE_OLDER_THAN}"; then

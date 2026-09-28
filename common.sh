@@ -28,7 +28,38 @@ is_positive_int() {
   [ "$1" -gt 0 ]
 }
 
+# file_env VAR loads VAR from the file named by VAR_FILE (Docker and Kubernetes
+# secrets). Setting both VAR and VAR_FILE is an error.
+file_env() {
+  _fe_var=$1
+  _fe_val=""
+  _fe_file=""
+  eval "_fe_val=\${$_fe_var:-}"
+  eval "_fe_file=\${${_fe_var}_FILE:-}"
+  if ! has_value "$_fe_file"; then
+    return 0
+  fi
+  if has_value "$_fe_val"; then
+    die "Both ${_fe_var} and ${_fe_var}_FILE are set; use only one."
+  fi
+  if [ ! -r "$_fe_file" ]; then
+    die "Cannot read ${_fe_var}_FILE: ${_fe_file}"
+  fi
+  # Command substitution drops trailing newlines, which secret files often have.
+  _fe_val=$(cat "$_fe_file")
+  eval "$_fe_var=\$_fe_val"
+  export "${_fe_var?}"
+}
+
+load_secret_files() {
+  for _secret in POSTGRES_USER POSTGRES_PASSWORD S3_ACCESS_KEY_ID S3_SECRET_ACCESS_KEY ENCRYPTION_PASSWORD; do
+    file_env "$_secret"
+  done
+}
+
 validate_common_env() {
+  load_secret_files
+
   has_value "${S3_BUCKET}" || die "You need to set the S3_BUCKET environment variable."
   has_value "${POSTGRES_DATABASE}" || die "You need to set the POSTGRES_DATABASE environment variable."
 
