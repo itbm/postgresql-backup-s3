@@ -16,7 +16,7 @@ LABEL maintainer="ITBM"
 
 RUN apk update \
 	&& apk upgrade \
-	&& apk add coreutils postgresql18-client aws-cli openssl pigz ca-certificates curl su-exec \
+	&& apk add coreutils postgresql18-client aws-cli openssl pigz ca-certificates curl su-exec tzdata \
 	&& adduser -D -H -s /sbin/nologin hook \
 	&& mkdir -p /hooks \
 	&& chown root:root /hooks \
@@ -41,9 +41,14 @@ ENV POSTGRES_DATABASE=**None** \
 	S3_CA_BUNDLE=**None** \
 	S3_SSL_VERIFY=yes \
 	S3_S3V4=no \
+	S3_STORAGE_CLASS=**None** \
+	S3_SSE=**None** \
+	S3_SSE_KMS_KEY_ID=**None** \
 	SCHEDULE=**None** \
+	BACKUP_ON_START=no \
 	ENCRYPTION_PASSWORD=**None** \
 	DELETE_OLDER_THAN=**None** \
+	DELETE_MATCH_DATABASE=no \
 	BACKUP_FILE=**None** \
 	CREATE_DATABASE=no \
 	DROP_DATABASE=no \

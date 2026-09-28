@@ -51,6 +51,44 @@ psql_admin() {
   psql $POSTGRES_HOST_OPTS -d postgres -v ON_ERROR_STOP=1 -Atq -c "$1"
 }
 
+# Sets BACKUP_FILE to the newest <POSTGRES_DATABASE>_<timestamp> backup in S3_PREFIX.
+resolve_latest_backup() {
+  echo "Finding the latest backup of ${POSTGRES_DATABASE} in ${S3_BASE_URI}"
+  aws $AWS_ARGS s3 ls "$S3_BASE_URI" > "$WORK_DIR/s3-listing" || exit 2
+  latest=""
+  while IFS= read -r line; do
+    case "$line" in
+      *' PRE '*|'') continue ;;
+    esac
+    name=$(echo "$line" | awk '{ $1=$2=$3=""; sub(/^ +/, ""); print }')
+    case "$name" in
+      "${POSTGRES_DATABASE}_"*) ;;
+      *) continue ;;
+    esac
+    # Require the timestamp so a database named app does not match app_archive_... backups.
+    rest=${name#"${POSTGRES_DATABASE}_"}
+    case "$rest" in
+      [0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9]Z.sql.gz|\
+      [0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9]Z.sql.gz.enc|\
+      [0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9]Z.dump|\
+      [0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9]Z.dump.enc) ;;
+      *) continue ;;
+    esac
+    echo "$name" >> "$WORK_DIR/candidates"
+  done < "$WORK_DIR/s3-listing"
+  # UTC ISO 8601 timestamps sort chronologically as strings.
+  if [ -f "$WORK_DIR/candidates" ]; then
+    latest=$(sort "$WORK_DIR/candidates" | tail -n 1)
+  fi
+  if [ -z "$latest" ]; then
+    echo "ERROR: No backups of ${POSTGRES_DATABASE} found in ${S3_BASE_URI}"
+    exit 1
+  fi
+  BACKUP_FILE="${S3_PREFIX_PATH:+${S3_PREFIX_PATH}/}${latest}"
+  export BACKUP_FILE
+  echo "Latest backup is ${BACKUP_FILE}"
+}
+
 restore_on_exit() {
   rc=$?
   trap - EXIT
@@ -70,6 +108,10 @@ trap 'exit 143' TERM
 trap 'exit 130' INT
 
 make_work_dir
+
+if [ "$BACKUP_FILE" = "latest" ]; then
+  resolve_latest_backup
+fi
 
 LOCAL_FILE=$(basename "$BACKUP_FILE")
 DOWNLOAD_PATH="$WORK_DIR/$LOCAL_FILE"

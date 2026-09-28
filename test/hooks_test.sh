@@ -263,6 +263,9 @@ fi
 write_fakes() {
   cat > "$FAKE_BIN/pg_dump" <<'EOF'
 #! /bin/sh
+if [ -n "${FAKE_PGPASS_LOG:-}" ]; then
+  printf 'PGPASSWORD=%s\nARGS=%s\n' "$PGPASSWORD" "$*" > "$FAKE_PGPASS_LOG"
+fi
 if [ "${FAKE_DUMP_EMPTY:-no}" = yes ]; then
   exit 0
 fi
@@ -315,8 +318,13 @@ while [ "\$#" -gt 0 ]; do
   shift
 done
 if [ "\$cmd" = cp ]; then
-  src=\$1
-  dest=\$2
+  # Options such as --storage-class come first; the last two arguments are the paths.
+  src=""
+  dest=""
+  for a in "\$@"; do
+    src=\$dest
+    dest=\$a
+  done
   if [ -f "\$src" ]; then
     rel=\${dest#s3://}
     basename "\$dest" > "$WORKDIR/last-upload"
@@ -674,7 +682,7 @@ RUN_DIR="$WORKDIR/run"
 mkdir -p "$RUN_DIR"
 printf 'echo BACKUP\n' > "$RUN_DIR/backup.sh"
 printf 'echo RESTORE\n' > "$RUN_DIR/restore.sh"
-printf '#! /bin/sh\necho GOCRON "$1"\n' > "$FAKE_BIN/go-cron"
+printf '#! /bin/sh\necho GOCRON "$@"\n' > "$FAKE_BIN/go-cron"
 printf '#! /bin/sh\nexit 0\n' > "$FAKE_BIN/update-ca-certificates"
 chmod +x "$FAKE_BIN/go-cron" "$FAKE_BIN/update-ca-certificates"
 run_entry() {
@@ -685,9 +693,9 @@ run_entry() {
     sh "$ROOT/run.sh"
   ) 2>&1
 }
-assert_eq "$(run_entry '' '')" "BACKUP" "run.sh empty SCHEDULE"
-assert_eq "$(run_entry '**None**' '@daily')" "GOCRON @daily" "run.sh with SCHEDULE"
-assert_eq "$(run_entry 'backup/x.sql.gz' '@daily')" "RESTORE" "run.sh with BACKUP_FILE"
+assert_eq "$(run_entry '' '')" "GOCRON --once /bin/sh backup.sh" "run.sh empty SCHEDULE"
+assert_eq "$(run_entry '**None**' '@daily')" "GOCRON @daily /bin/sh backup.sh" "run.sh with SCHEDULE"
+assert_eq "$(run_entry 'backup/x.sql.gz' '@daily')" "GOCRON --once /bin/sh restore.sh" "run.sh with BACKUP_FILE"
 unset TMPDIR
 
 # --- Phase 2: retention options and dump verification ---
@@ -765,6 +773,107 @@ reset_logs
 assert_ok run_script backup.sh COMPRESSION_CMD=cat
 
 assert_eq "$(ls "$TMPDIR" | wc -l | tr -d ' ')" "0" "temp dir cleaned after phase 2 tests"
+unset TMPDIR
+
+# --- Phase 3: secrets from files, restore latest, upload options, BACKUP_ON_START ---
+
+export TMPDIR="$WORKDIR/tmp"
+SECRETS="$WORKDIR/secrets"
+mkdir -p "$SECRETS"
+printf 'filepass\n' > "$SECRETS/pgpass"
+printf 'fileuser\n' > "$SECRETS/pguser"
+printf 'encpass\n' > "$SECRETS/encpass"
+
+# *_FILE secrets are loaded, with the trailing newline removed.
+reset_logs
+assert_ok run_script backup.sh POSTGRES_PASSWORD='**None**' "POSTGRES_PASSWORD_FILE=$SECRETS/pgpass" POSTGRES_USER= "POSTGRES_USER_FILE=$SECRETS/pguser" "FAKE_PGPASS_LOG=$WORKDIR/pgpass.log"
+if grep -q '^PGPASSWORD=filepass$' "$WORKDIR/pgpass.log" && grep -q '^ARGS=.* -U fileuser ' "$WORKDIR/pgpass.log"; then
+  pass
+else
+  fail "POSTGRES_PASSWORD_FILE/POSTGRES_USER_FILE not used: $(cat "$WORKDIR/pgpass.log")"
+fi
+
+# Setting both a variable and its _FILE form is rejected, as is an unreadable file.
+assert_fail run_script backup.sh "POSTGRES_PASSWORD_FILE=$SECRETS/pgpass"
+assert_fail run_script backup.sh POSTGRES_PASSWORD= "POSTGRES_PASSWORD_FILE=$SECRETS/missing"
+
+# ENCRYPTION_PASSWORD_FILE encrypts with the file's password.
+reset_logs
+assert_ok run_script backup.sh "ENCRYPTION_PASSWORD_FILE=$SECRETS/encpass"
+ENC_KEY=$(last_upload_key)
+ENC_OBJ="$WORKDIR/s3/${ENC_KEY#s3://}"
+case "$ENC_KEY" in
+  *.sql.gz.enc) pass ;;
+  *) fail "ENCRYPTION_PASSWORD_FILE did not encrypt: $ENC_KEY" ;;
+esac
+if openssl enc -aes-256-cbc -d -pbkdf2 -iter 100000 -in "$ENC_OBJ" -pass pass:encpass 2>/dev/null | gunzip -c | grep -q 'SELECT 1;'; then
+  pass
+else
+  fail "backup not decryptable with the password from ENCRYPTION_PASSWORD_FILE"
+fi
+
+# BACKUP_FILE=latest restores the newest matching backup.
+reset_logs
+mkdir -p "$WORKDIR/s3/test-bucket/backup"
+cat > "$WORKDIR/s3-ls.txt" <<LS
+                           PRE nested/
+2030-01-01 00:00:00         10 appdb_2024-01-01T00:00:00Z.sql.gz
+2020-01-01 00:00:00         10 appdb_2025-06-01T12:00:00Z.dump
+2020-01-01 00:00:00         10 appdb_2025-01-01T00:00:00Z.sql.gz.enc
+2020-01-01 00:00:00         10 appdb_archive_2026-01-01T00:00:00Z.sql.gz
+2020-01-01 00:00:00         10 otherdb_2026-01-01T00:00:00Z.sql.gz
+2020-01-01 00:00:00         10 appdb_notes.txt
+LS
+printf 'custom' > "$WORKDIR/s3/test-bucket/backup/appdb_2025-06-01T12:00:00Z.dump"
+PRE_RESTORE_ENV="$WORKDIR/pre-restore.env"
+printf '#! /bin/sh\nenv > "%s"\n' "$PRE_RESTORE_ENV" > "$HOOKS_DIR/pre-restore"
+chmod +x "$HOOKS_DIR/pre-restore"
+assert_ok run_script restore.sh BACKUP_FILE=latest
+if grep -q 's3 cp s3://test-bucket/backup/appdb_2025-06-01T12:00:00Z.dump ' "$WORKDIR/aws.log"; then
+  pass
+else
+  fail "BACKUP_FILE=latest picked the wrong file:"
+  cat "$WORKDIR/aws.log" "$WORKDIR/last.out" >&2
+fi
+if grep -q '^BACKUP_FILE=backup/appdb_2025-06-01T12:00:00Z.dump$' "$PRE_RESTORE_ENV"; then
+  pass
+else
+  fail "pre-restore hook did not see the resolved BACKUP_FILE"
+fi
+rm -f "$HOOKS_DIR"/*
+
+# BACKUP_FILE=latest with an empty prefix and with no matching backups.
+reset_logs
+mkdir -p "$WORKDIR/s3/test-bucket"
+printf '2020-01-01 00:00:00         10 appdb_2025-06-01T12:00:00Z.dump\n' > "$WORKDIR/s3-ls.txt"
+printf 'custom' > "$WORKDIR/s3/test-bucket/appdb_2025-06-01T12:00:00Z.dump"
+assert_ok run_script restore.sh BACKUP_FILE=latest S3_PREFIX=
+if grep -q 's3 cp s3://test-bucket/appdb_2025-06-01T12:00:00Z.dump ' "$WORKDIR/aws.log"; then pass; else fail "latest with empty prefix"; fi
+reset_logs
+printf '2020-01-01 00:00:00         10 otherdb_2025-06-01T12:00:00Z.dump\n' > "$WORKDIR/s3-ls.txt"
+assert_fail run_script restore.sh BACKUP_FILE=latest
+if grep -q 'No backups of appdb found' "$WORKDIR/last.out"; then pass; else fail "missing no-backups message"; fi
+
+# Upload options are passed to the upload only.
+reset_logs
+assert_ok run_script backup.sh S3_STORAGE_CLASS=STANDARD_IA S3_SSE=aws:kms S3_SSE_KMS_KEY_ID=alias/backups
+if grep -qE '(^| )s3 cp --storage-class STANDARD_IA --sse aws:kms --sse-kms-key-id alias/backups ' "$WORKDIR/aws.log"; then
+  pass
+else
+  fail "upload options missing: $(cat "$WORKDIR/aws.log")"
+fi
+case "$(last_upload_key)" in
+  s3://test-bucket/backup/appdb_*.sql.gz) pass ;;
+  *) fail "upload key with options: $(last_upload_key)" ;;
+esac
+assert_fail run_script backup.sh S3_SSE=rot13
+assert_fail run_script backup.sh S3_SSE_KMS_KEY_ID=alias/backups
+
+# BACKUP_ON_START asks go-cron to run a backup before the first scheduled run.
+assert_eq "$(BACKUP_ON_START=yes run_entry '**None**' '@daily')" "GOCRON --run-on-start @daily /bin/sh backup.sh" "BACKUP_ON_START=yes"
+assert_eq "$(BACKUP_ON_START=no run_entry '**None**' '@daily')" "GOCRON @daily /bin/sh backup.sh" "BACKUP_ON_START=no"
+
+assert_eq "$(ls "$TMPDIR" | wc -l | tr -d ' ')" "0" "temp dir cleaned after phase 3 tests"
 unset TMPDIR
 
 echo "Passed: $PASS  Failed: $FAIL"
