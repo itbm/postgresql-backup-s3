@@ -14,6 +14,30 @@ set_backup_uri() {
   export BACKUP_DEST_FILE BACKUP_S3_URI
 }
 
+verify_dump() {
+  if [ ! -s "$SRC_FILE" ]; then
+    echo "ERROR: The dump file is empty; not uploading it."
+    exit 1
+  fi
+  if [ "$USE_CUSTOM_FORMAT" = "yes" ]; then
+    if ! pg_restore --list "$SRC_FILE" >/dev/null; then
+      echo "ERROR: The custom-format dump failed verification; not uploading it."
+      exit 1
+    fi
+    return 0
+  fi
+  # Only gzip output can be checked; other compressors are uploaded as they are.
+  set -- $COMPRESSION_CMD
+  case "$(basename "$1")" in
+    gzip|pigz)
+      if ! gzip -t "$SRC_FILE"; then
+        echo "ERROR: The compressed dump failed verification; not uploading it."
+        exit 1
+      fi
+      ;;
+  esac
+}
+
 validate_common_env
 
 if has_value "${DELETE_OLDER_THAN}"; then
@@ -72,6 +96,8 @@ else
   fi
 fi
 
+verify_dump
+
 if has_value "${ENCRYPTION_PASSWORD}"; then
   >&2 echo "Encrypting ${SRC_FILE}"
   if ! openssl enc -aes-256-cbc -pbkdf2 -iter 100000 -salt -in "$SRC_FILE" -out "${SRC_FILE}.enc" -pass env:ENCRYPTION_PASSWORD; then
@@ -93,6 +119,8 @@ if has_value "${DELETE_OLDER_THAN}"; then
   >&2 echo "Checking for files older than ${DELETE_OLDER_THAN}"
   listing_file="$WORK_DIR/s3-listing"
   aws $AWS_ARGS s3 ls "$S3_BASE_URI" > "$listing_file" || exit 2
+  deleted=0
+  kept=0
   while IFS= read -r line
     do
       [ -n "$line" ] || continue
@@ -100,19 +128,30 @@ if has_value "${DELETE_OLDER_THAN}"; then
         *' PRE '*) continue ;;
       esac
       fileName=$(echo "$line" | awk '{ $1=$2=$3=""; sub(/^ +/, ""); print }')
+      [ -n "$fileName" ] || continue
+      # Never delete the backup this run just uploaded.
+      [ "$fileName" != "$DEST_FILE" ] || continue
+      if [ "${DELETE_MATCH_DATABASE}" = "yes" ]; then
+        case "$fileName" in
+          "${POSTGRES_DATABASE}_"*) ;;
+          *) continue ;;
+        esac
+      fi
       created=$(echo "$line" | awk '{print $1" "$2}')
       created=$(date -d "$created" +%s)
-      if [ "$created" -lt "$older_than" ]
-        then
-          if [ -n "$fileName" ]
-            then
-              >&2 echo "DELETING ${fileName}"
-              aws $AWS_ARGS s3 rm "${S3_BASE_URI}${fileName}"
-          fi
+      if [ "$created" -lt "$older_than" ]; then
+        >&2 echo "DELETING ${fileName}"
+        if ! aws $AWS_ARGS s3 rm "${S3_BASE_URI}${fileName}"; then
+          >&2 echo "ERROR: Failed to delete ${fileName}"
+          exit 2
+        fi
+        deleted=$((deleted + 1))
       else
-          >&2 echo "${fileName} not older than ${DELETE_OLDER_THAN}"
+        >&2 echo "${fileName} not older than ${DELETE_OLDER_THAN}"
+        kept=$((kept + 1))
       fi
     done < "$listing_file"
+  >&2 echo "Retention: deleted ${deleted} file(s), kept ${kept} newer file(s)"
 fi
 
 echo "SQL backup finished"

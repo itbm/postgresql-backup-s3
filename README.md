@@ -104,6 +104,7 @@ An empty value is treated the same as an unset variable.
 | COMMAND_TIMEOUT      |           |          | Max duration for a scheduled backup (`go` duration, e.g. `2h`). Empty/`0` disables the timeout (default)                 |
 | ENCRYPTION_PASSWORD  |           |          | Password to encrypt/decrypt the backup                                                                                   |
 | DELETE_OLDER_THAN    |           |          | Delete old backups, see explanation and warning below                                                                    |
+| DELETE_MATCH_DATABASE | no       |          | Set to `yes` so `DELETE_OLDER_THAN` only deletes files named `<POSTGRES_DATABASE>_*` in `S3_PREFIX`                      |
 | USE_CUSTOM_FORMAT    | no        |          | Use PostgreSQL's custom format (-Fc) instead of plain text with compression                                              |
 | COMPRESSION_CMD      | gzip      |          | Command used to compress the backup (e.g. `pigz` for parallel compression) - ignored when USE_CUSTOM_FORMAT=yes          |
 | DECOMPRESSION_CMD    | gunzip -c |          | Command used to decompress the backup (e.g. `pigz -dc` for parallel decompression) - ignored when USE_CUSTOM_FORMAT=yes  |
@@ -168,11 +169,17 @@ More information about the scheduling can be found [here](http://godoc.org/githu
 
 You can additionally set the `DELETE_OLDER_THAN` environment variable like `-e DELETE_OLDER_THAN="30 days ago"` to delete old backups.
 
-WARNING: this will delete all files in the S3_PREFIX path, not just those created by this script.
+WARNING: by default this deletes all files in the S3_PREFIX path, not just those created by this script. Set `-e DELETE_MATCH_DATABASE=yes` to delete only this database's backups (files named `<POSTGRES_DATABASE>_*`). This is recommended when several databases or other files share a prefix.
+
+The backup uploaded by the current run is never deleted. A failed delete fails the backup, and the log shows how many files were deleted and kept.
 
 ### Encryption
 
 You can additionally set the `ENCRYPTION_PASSWORD` environment variable like `-e ENCRYPTION_PASSWORD="superstrongpassword"` to encrypt the backup. New backups use AES-256-CBC with PBKDF2 (100000 iterations). The restore process detects encrypted backups and decrypts them when `ENCRYPTION_PASSWORD` is set; legacy (pre-PBKDF2) backups are still accepted with a warning. Manual decrypt for current backups: `openssl enc -aes-256-cbc -d -pbkdf2 -iter 100000 -in backup.sql.gz.enc -out backup.sql.gz`.
+
+### Backup verification
+
+Each dump is checked before it is uploaded. An empty dump is rejected. Custom-format dumps must be readable by `pg_restore --list`, and `gzip` or `pigz` output must pass `gzip -t`. Output from other compression commands is not checked. A dump that fails these checks fails the backup and is not uploaded.
 
 ### Backup Format and Compression Options
 

@@ -2,7 +2,7 @@
 # Tests for hooks.sh and backup/restore hook points.
 # Run from anywhere: sh test/hooks_test.sh
 
-ROOT=$(CDPATH= cd -- "$(dirname "$0")/.." && pwd)
+ROOT=$(CDPATH='' cd -- "$(dirname "$0")/.." && pwd)
 # Shell used to run backup.sh/restore.sh; the image uses BusyBox sh.
 SCRIPT_SHELL=${SCRIPT_SHELL:-bash}
 export HOOK_DROP_PRIVS=no
@@ -208,6 +208,7 @@ cat > "$HOOKS_DIR/backup-error" <<EOF
 env | sort > "$WORKDIR/error.env"
 EOF
 chmod +x "$HOOKS_DIR/backup-error"
+# shellcheck disable=SC2034 # read by hooks.sh
 HOOK_EXIT_CODE=7
 assert_ok hook_run_script backup-error
 if grep -q '^HOOK_EXIT_CODE=7$' "$WORKDIR/error.env"; then
@@ -262,6 +263,9 @@ fi
 write_fakes() {
   cat > "$FAKE_BIN/pg_dump" <<'EOF'
 #! /bin/sh
+if [ "${FAKE_DUMP_EMPTY:-no}" = yes ]; then
+  exit 0
+fi
 echo "SELECT 1;"
 exit 0
 EOF
@@ -272,6 +276,13 @@ exit 0
 EOF
   cat > "$FAKE_BIN/pg_restore" <<'EOF'
 #! /bin/sh
+case " $* " in
+  *" --list "*)
+    if [ "${FAKE_RESTORE_LIST_FAIL:-no}" = yes ]; then
+      exit 1
+    fi
+    ;;
+esac
 exit 0
 EOF
   cat > "$FAKE_BIN/psql" <<EOF
@@ -308,6 +319,7 @@ if [ "\$cmd" = cp ]; then
   dest=\$2
   if [ -f "\$src" ]; then
     rel=\${dest#s3://}
+    basename "\$dest" > "$WORKDIR/last-upload"
     mkdir -p "$WORKDIR/s3/\$(dirname "\$rel")"
     cp "\$src" "$WORKDIR/s3/\$rel"
     exit 0
@@ -318,9 +330,15 @@ if [ "\$cmd" = cp ]; then
 fi
 if [ "\$cmd" = ls ]; then
   cat "$WORKDIR/s3-ls.txt" 2>/dev/null
+  if [ "\${FAKE_LS_INCLUDE_UPLOAD:-no}" = yes ]; then
+    echo "2000-01-01 00:00:00 10 \$(cat "$WORKDIR/last-upload")"
+  fi
   exit 0
 fi
 if [ "\$cmd" = rm ]; then
+  if [ "\${FAKE_RM_FAIL:-no}" = yes ]; then
+    exit 1
+  fi
   printf '%s\n' "\$1" >> "$WORKDIR/aws-rm.log"
   exit 0
 fi
@@ -495,12 +513,12 @@ run_script() {
   _script=$1
   shift
   (
-    cd "$ROOT"
+    cd "$ROOT" || exit 1
     PATH="$FAKE_BIN:$PATH"
     common_env
     export HOOK_DROP_PRIVS=no HOOK_INHERIT_ENV=no
     for _kv in "$@"; do
-      export "$_kv"
+      export "${_kv?}"
     done
     $SCRIPT_SHELL "$ROOT/$_script"
   ) > "$WORKDIR/last.out" 2>&1
@@ -661,7 +679,7 @@ printf '#! /bin/sh\nexit 0\n' > "$FAKE_BIN/update-ca-certificates"
 chmod +x "$FAKE_BIN/go-cron" "$FAKE_BIN/update-ca-certificates"
 run_entry() {
   (
-    cd "$RUN_DIR"
+    cd "$RUN_DIR" || exit 1
     PATH="$FAKE_BIN:$PATH"
     export BACKUP_FILE="$1" SCHEDULE="$2" S3_S3V4=no S3_CA_BUNDLE=
     sh "$ROOT/run.sh"
@@ -670,6 +688,83 @@ run_entry() {
 assert_eq "$(run_entry '' '')" "BACKUP" "run.sh empty SCHEDULE"
 assert_eq "$(run_entry '**None**' '@daily')" "GOCRON @daily" "run.sh with SCHEDULE"
 assert_eq "$(run_entry 'backup/x.sql.gz' '@daily')" "RESTORE" "run.sh with BACKUP_FILE"
+unset TMPDIR
+
+# --- Phase 2: retention options and dump verification ---
+
+export TMPDIR="$WORKDIR/tmp"
+
+write_old_listing() {
+  cat > "$WORKDIR/s3-ls.txt" <<LS
+                           PRE nested/
+2000-01-01 00:00:00         10 appdb_2000-01-01T00:00:00Z.sql.gz
+2000-01-01 00:00:00         10 otherdb_2000-01-01T00:00:00Z.sql.gz
+2000-01-01 00:00:00         10 notes with spaces.txt
+2999-01-01 00:00:00         10 appdb_2999-01-01T00:00:00Z.sql.gz
+LS
+}
+
+# Default retention keeps the current behaviour: every old file in the prefix is deleted.
+reset_logs
+write_old_listing
+assert_ok run_script backup.sh "DELETE_OLDER_THAN=30 days ago"
+assert_eq "$(sort "$WORKDIR/aws-rm.log" | tr '\n' '|')" "s3://test-bucket/backup/appdb_2000-01-01T00:00:00Z.sql.gz|s3://test-bucket/backup/notes with spaces.txt|s3://test-bucket/backup/otherdb_2000-01-01T00:00:00Z.sql.gz|" "default retention deletes all old files"
+if grep -q 'Retention: deleted 3 file(s), kept 1 newer file(s)' "$WORKDIR/last.out"; then pass; else fail "retention summary missing"; fi
+
+# DELETE_MATCH_DATABASE=yes only deletes this database's backups.
+reset_logs
+write_old_listing
+assert_ok run_script backup.sh "DELETE_OLDER_THAN=30 days ago" DELETE_MATCH_DATABASE=yes
+assert_eq "$(cat "$WORKDIR/aws-rm.log")" "s3://test-bucket/backup/appdb_2000-01-01T00:00:00Z.sql.gz" "DELETE_MATCH_DATABASE=yes deletes only matching files"
+
+# The backup uploaded by this run is never deleted, even if its listed time is old.
+reset_logs
+assert_ok run_script backup.sh "DELETE_OLDER_THAN=30 days ago" FAKE_LS_INCLUDE_UPLOAD=yes
+if [ -f "$WORKDIR/aws-rm.log" ]; then
+  fail "retention deleted the backup it just uploaded: $(cat "$WORKDIR/aws-rm.log")"
+else
+  pass
+fi
+
+# A failed delete fails the backup.
+reset_logs
+write_old_listing
+assert_fail run_script backup.sh "DELETE_OLDER_THAN=30 days ago" FAKE_RM_FAIL=yes
+
+# An empty dump is never uploaded.
+reset_logs
+assert_fail run_script backup.sh USE_CUSTOM_FORMAT=yes FAKE_DUMP_EMPTY=yes
+if [ -f "$WORKDIR/aws.log" ]; then fail "empty dump was uploaded"; else pass; fi
+
+# A custom-format dump that pg_restore cannot read is never uploaded.
+reset_logs
+assert_fail run_script backup.sh USE_CUSTOM_FORMAT=yes FAKE_RESTORE_LIST_FAIL=yes
+if [ -f "$WORKDIR/aws.log" ]; then fail "unreadable custom dump was uploaded"; else pass; fi
+reset_logs
+assert_ok run_script backup.sh USE_CUSTOM_FORMAT=yes
+
+# A corrupt gzip stream is never uploaded.
+GZ_BIN="$WORKDIR/gzbin"
+mkdir -p "$GZ_BIN"
+REAL_GZIP=$(command -v gzip)
+cat > "$GZ_BIN/gzip" <<GZ
+#! /bin/sh
+if [ "\$1" = -t ]; then
+  exec "$REAL_GZIP" "\$@"
+fi
+cat >/dev/null
+printf 'not gzip data'
+GZ
+chmod +x "$GZ_BIN/gzip"
+reset_logs
+assert_fail run_script backup.sh "PATH=$GZ_BIN:$FAKE_BIN:$PATH"
+if [ -f "$WORKDIR/aws.log" ]; then fail "corrupt gzip dump was uploaded"; else pass; fi
+
+# Other compressors are not checked with gzip -t.
+reset_logs
+assert_ok run_script backup.sh COMPRESSION_CMD=cat
+
+assert_eq "$(ls "$TMPDIR" | wc -l | tr -d ' ')" "0" "temp dir cleaned after phase 2 tests"
 unset TMPDIR
 
 echo "Passed: $PASS  Failed: $FAIL"
