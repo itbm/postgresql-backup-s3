@@ -142,7 +142,7 @@ func (r *run) Line(stream, line string) {
 		iostream = semconv.LogIostreamStderr
 	}
 	// The scripts print progress on stderr, so both streams are INFO.
-	r.t.emit(r.ctx, log.SeverityInfo, "INFO", cleanText(r.secrets.apply(line), true), iostream)
+	r.t.emit(r.ctx, log.SeverityInfo, "INFO", logBody(cleanText(r.secrets.apply(line), true)), iostream)
 }
 
 // TraceID returns the root span's trace ID when the trace is exported.

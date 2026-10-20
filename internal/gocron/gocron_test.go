@@ -201,6 +201,30 @@ func TestLineWriterSplitsLongLines(t *testing.T) {
 	}
 }
 
+// A line of exactly maxLineBytes must not gain an empty line when its
+// newline arrives in a later write.
+func TestLineWriterFullLengthLineSplitAcrossWrites(t *testing.T) {
+	var lines []string
+	w := &lineWriter{emit: func(l string) { lines = append(lines, l) }}
+	full := strings.Repeat("x", maxLineBytes)
+	for _, chunk := range []string{full[:32*1024], full[32*1024:], "\n", "after\n"} {
+		if _, err := w.Write([]byte(chunk)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if len(lines) != 2 || len(lines[0]) != maxLineBytes || lines[1] != "after" {
+		t.Errorf("got %d lines, lengths %v", len(lines), lengths(lines))
+	}
+}
+
+func lengths(lines []string) []int {
+	var n []int
+	for _, l := range lines {
+		n = append(n, len(l))
+	}
+	return n
+}
+
 func TestChildEnvDropsReservedVariables(t *testing.T) {
 	t.Setenv(TelemetryFileEnv, "/tmp/inherited")
 	t.Setenv("GOCRON_TEST_KEEP", "yes")
@@ -211,6 +235,24 @@ func TestChildEnvDropsReservedVariables(t *testing.T) {
 	}
 	if !strings.Contains(joined, "\nGOCRON_TEST_KEEP=yes\n") {
 		t.Errorf("childEnv dropped an ordinary variable")
+	}
+}
+
+// With only reserved variables set, childEnv must return an empty, non-nil
+// environment: exec gives the command go-cron's environment for a nil Env.
+func TestChildEnvWithOnlyReservedVariables(t *testing.T) {
+	saved := os.Environ()
+	t.Cleanup(func() {
+		os.Clearenv()
+		for _, kv := range saved {
+			k, v, _ := strings.Cut(kv, "=")
+			os.Setenv(k, v)
+		}
+	})
+	os.Clearenv()
+	os.Setenv(TelemetryFileEnv, "/tmp/inherited")
+	if env := childEnv(); env == nil || len(env) != 0 {
+		t.Errorf("childEnv() = %#v, want an empty non-nil slice", env)
 	}
 }
 

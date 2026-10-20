@@ -62,7 +62,8 @@ func (w *lineWriter) Write(p []byte) (int, error) {
 			w.buf = w.buf[i+1:]
 			continue
 		}
-		if len(w.buf) < maxLineBytes {
+		// Wait for the byte after a full-length chunk: it may be its newline.
+		if len(w.buf) <= maxLineBytes {
 			break
 		}
 		w.emit(string(w.buf[:maxLineBytes]))
@@ -130,7 +131,8 @@ func commandTimeout() (time.Duration, error) {
 // childEnv returns go-cron's environment without the variables reserved for
 // go-cron itself.
 func childEnv() []string {
-	var env []string
+	// Never nil: exec treats a nil Env as "inherit go-cron's environment".
+	env := []string{}
 	for _, kv := range os.Environ() {
 		if strings.HasPrefix(kv, TelemetryFileEnv+"=") {
 			continue

@@ -687,7 +687,8 @@ func TestIntegrationDisabled(t *testing.T) {
 				t.Errorf("receiver got %d requests", rc.count())
 			}
 			got := readEnvFile(t, envOut)
-			for _, k := range []string{"PGBACKUP_TELEMETRY_FILE", "TRACEPARENT", "TRACESTATE"} {
+			// The OTLP headers are kept from the command even with telemetry off.
+			for _, k := range []string{"PGBACKUP_TELEMETRY_FILE", "TRACEPARENT", "TRACESTATE", "OTEL_EXPORTER_OTLP_HEADERS"} {
 				if v, ok := got[k]; ok {
 					t.Errorf("the command saw %s=%q", k, v)
 				}

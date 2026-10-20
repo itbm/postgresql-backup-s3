@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"os"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -107,11 +108,15 @@ type scheduleState struct {
 }
 
 // newTelemetry is passed to gocron.Main. It returns gocron.NoTelemetry when
-// no signal is enabled, so go-cron then behaves exactly as without
-// OpenTelemetry: no temporary files and no network.
+// no signal is enabled, so go-cron then behaves as without OpenTelemetry: no
+// temporary files and no network. The OTLP headers are still kept from the
+// command, which never needs them.
 func newTelemetry(print gocron.Printer) gocron.Telemetry {
 	if t := setup(context.Background(), print); t != nil {
 		return t
+	}
+	for k := range childEnvRemoved {
+		os.Unsetenv(k)
 	}
 	return gocron.NoTelemetry{}
 }
@@ -292,7 +297,7 @@ func (t *telemetry) Log(severity, message string) {
 	default:
 		severity = "INFO"
 	}
-	t.emit(ctx, sev, severity, cleanText(secrets.apply(message), true))
+	t.emit(ctx, sev, severity, logBody(cleanText(secrets.apply(message), true)))
 }
 
 func (t *telemetry) emit(ctx context.Context, sev log.Severity, text, body string, attrs ...attribute.KeyValue) {

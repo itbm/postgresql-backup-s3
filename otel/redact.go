@@ -24,6 +24,9 @@ const (
 	maxSecretFileBytes = 4 << 10
 	// maxMessageBytes caps telemetry's own messages and span status text.
 	maxMessageBytes = 512
+	// maxLogBodyBytes caps a log record body, which bounds the log queue's
+	// memory and keeps an export batch under a Collector's request limit.
+	maxLogBodyBytes = 8 << 10
 )
 
 // secretVars hold secrets as their values.
@@ -165,6 +168,14 @@ func truncate(s string, n int) string {
 		n--
 	}
 	return s[:n]
+}
+
+// logBody cuts a log record body to maxLogBodyBytes, marking the cut.
+func logBody(s string) string {
+	if len(s) <= maxLogBodyBytes {
+		return s
+	}
+	return truncate(s, maxLogBodyBytes) + "…[truncated]"
 }
 
 // sanitise turns s into one line of valid UTF-8 without control characters,

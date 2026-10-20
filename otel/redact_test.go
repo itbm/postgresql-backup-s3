@@ -133,3 +133,17 @@ func TestLogSink(t *testing.T) {
 		t.Errorf("printed %q, want %q", printed, want)
 	}
 }
+
+func TestLogBody(t *testing.T) {
+	if got := logBody("short line"); got != "short line" {
+		t.Errorf("logBody(short) = %q", got)
+	}
+	long := strings.Repeat("é", maxLogBodyBytes) // two bytes per character
+	got := logBody(long)
+	if !strings.HasSuffix(got, "…[truncated]") || !utf8.ValidString(got) {
+		t.Errorf("logBody(long) does not end in the marker or is not valid UTF-8")
+	}
+	if body := strings.TrimSuffix(got, "…[truncated]"); len(body) > maxLogBodyBytes {
+		t.Errorf("logBody kept %d bytes, want at most %d", len(body), maxLogBodyBytes)
+	}
+}
