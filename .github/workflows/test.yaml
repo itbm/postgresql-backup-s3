@@ -25,16 +25,39 @@ jobs:
       - name: Run hook unit tests
         run: sh test/hooks_test.sh
 
-  e2e:
-    name: End-to-end tests
+  e2e-cases:
+    name: List end-to-end case files
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 5
+    outputs:
+      cases: ${{ steps.list.outputs.cases }}
+    steps:
+      - name: Check out the repo
+        uses: actions/checkout@v5
+
+      - name: List case files
+        id: list
+        run: |
+          cases=$(find test/e2e/cases -maxdepth 1 -name '*.sh' -printf '%f\n' | sort \
+            | jq -Rcs 'split("\n") | map(select(. != ""))')
+          echo "cases=$cases" >> "$GITHUB_OUTPUT"
+
+  e2e:
+    name: End-to-end (${{ matrix.cases }})
+    needs: e2e-cases
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        cases: ${{ fromJSON(needs.e2e-cases.outputs.cases) }}
     steps:
       - name: Check out the repo
         uses: actions/checkout@v5
 
       - name: Run end-to-end tests
         env:
+          E2E_CASES: ${{ matrix.cases }}
           E2E_ARTIFACTS: ${{ runner.temp }}/e2e-artifacts
         run: bash test/e2e/run.sh
 
@@ -42,6 +65,22 @@ jobs:
         if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: e2e-failures
+          name: e2e-failures-${{ matrix.cases }}
           path: ${{ runner.temp }}/e2e-artifacts
           if-no-files-found: ignore
+
+  # One stable check name to require in branch protection.
+  e2e-result:
+    name: End-to-end tests
+    if: always()
+    needs: [e2e-cases, e2e]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Check that every case file passed
+        env:
+          LIST_RESULT: ${{ needs.e2e-cases.result }}
+          E2E_RESULT: ${{ needs.e2e.result }}
+        run: |
+          echo "list: $LIST_RESULT, e2e: $E2E_RESULT"
+          [ "$LIST_RESULT" = success ] && [ "$E2E_RESULT" = success ]
