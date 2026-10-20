@@ -628,7 +628,6 @@ test_validation_empty_aws_ca_bundle_keeps_certificate_checks() {
   db=$(new_db) || exit 1
   bucket=$(S3_ALIAS=tls new_bucket) || exit 1
 
-  xfail "an empty AWS_CA_BUNDLE is passed to the AWS CLI, which then skips certificate verification (InsecureRequestWarning) although S3_SSL_VERIFY is yes, so the backup goes to an untrusted endpoint"
   bk_backup backup "$db" "$bucket" --unset S3_ENDPOINT -e S3_ENDPOINT=https://minio-tls:9000 -e AWS_CA_BUNDLE=
   assert_eq "$(S3_ALIAS=tls s3_count "$bucket" "")" 0 "objects uploaded without a trusted certificate"
   assert_rc 2 "backup to an untrusted TLS endpoint with an empty AWS_CA_BUNDLE"
@@ -705,7 +704,6 @@ test_validation_empty_compression_cmd_uses_gzip() {
   db=$(new_db) || exit 1
   bucket=$(new_bucket) || exit 1
 
-  xfail "an empty COMPRESSION_CMD leaves 'pg_dump ... | > file', so pg_dump is killed by SIGPIPE and every plain backup exits 141"
   bk_backup backup "$db" "$bucket" -e COMPRESSION_CMD=
   assert_rc 0 "backup with an empty COMPRESSION_CMD"
   key=$(s3_single_key "$bucket" backup/) || exit 1
@@ -723,7 +721,6 @@ test_validation_empty_decompression_cmd_uses_gunzip() {
   key=$(s3_single_key "$bucket" backup/) || exit 1
 
   restored="${db}_copy"
-  xfail "an empty DECOMPRESSION_CMD makes restore.sh execute the downloaded file itself ('Permission denied', exit 126), so every plain restore fails"
   bk_restore restore "$restored" "$bucket" "$key" -e CREATE_DATABASE=yes -e DECOMPRESSION_CMD=
   assert_rc 0 "restore with an empty DECOMPRESSION_CMD"
   assert_same_data "$db" "$restored"

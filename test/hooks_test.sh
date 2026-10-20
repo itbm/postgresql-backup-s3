@@ -307,6 +307,7 @@ EOF
   cat > "$FAKE_BIN/aws" <<EOF
 #! /bin/sh
 printf '%s\n' "\$*" >> "$WORKDIR/aws.log"
+printf 'AWS_CA_BUNDLE=%s\n' "\${AWS_CA_BUNDLE-<unset>}" >> "$WORKDIR/aws-env.log"
 cmd=""
 while [ "\$#" -gt 0 ]; do
   if [ "\$1" = s3 ]; then
@@ -885,6 +886,40 @@ assert_eq "$(BACKUP_ON_START=yes run_entry '**None**' '@daily')" "GOCRON --run-o
 assert_eq "$(BACKUP_ON_START=no run_entry '**None**' '@daily')" "GOCRON @daily /bin/sh backup.sh" "BACKUP_ON_START=no"
 
 assert_eq "$(ls "$TMPDIR" | wc -l | tr -d ' ')" "0" "temp dir cleaned after phase 3 tests"
+unset TMPDIR
+
+# --- Empty compression commands and AWS_CA_BUNDLE fall back to safe defaults ---
+
+export TMPDIR="$WORKDIR/tmp"
+reset_logs
+assert_ok run_script backup.sh COMPRESSION_CMD=
+EMPTY_GZ_KEY=$(last_upload_key)
+if gzip -t "$WORKDIR/s3/${EMPTY_GZ_KEY#s3://}" 2>/dev/null; then
+  pass
+else
+  fail "empty COMPRESSION_CMD did not produce gzip output: $EMPTY_GZ_KEY"
+fi
+
+reset_logs
+mkdir -p "$WORKDIR/s3/test-bucket/backup"
+printf 'SELECT 1;\n' | gzip > "$WORKDIR/s3/test-bucket/backup/appdb.sql.gz"
+assert_ok run_script restore.sh BACKUP_FILE=backup/appdb.sql.gz DECOMPRESSION_CMD=
+if grep -q 'SELECT 1;' "$WORKDIR/psql.stdin" 2>/dev/null; then
+  pass
+else
+  fail "empty DECOMPRESSION_CMD did not decompress the backup"
+fi
+
+rm -f "$WORKDIR/aws-env.log"
+assert_ok run_script backup.sh AWS_CA_BUNDLE=
+if grep -qv '^AWS_CA_BUNDLE=<unset>$' "$WORKDIR/aws-env.log"; then
+  fail "empty AWS_CA_BUNDLE reached the AWS CLI: $(sort -u "$WORKDIR/aws-env.log")"
+else
+  pass
+fi
+rm -f "$WORKDIR/aws-env.log"
+assert_ok run_script backup.sh AWS_CA_BUNDLE=/certs/ca.pem
+assert_eq "$(sort -u "$WORKDIR/aws-env.log")" "AWS_CA_BUNDLE=/certs/ca.pem" "AWS_CA_BUNDLE passed through"
 unset TMPDIR
 
 echo "Passed: $PASS  Failed: $FAIL"

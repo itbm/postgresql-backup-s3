@@ -75,6 +75,10 @@ validate_common_env() {
     POSTGRES_PORT=5432
   fi
 
+  # Empty compression commands would leave a bare pipe or run the dump file itself.
+  has_value "${COMPRESSION_CMD}" || COMPRESSION_CMD=gzip
+  has_value "${DECOMPRESSION_CMD}" || DECOMPRESSION_CMD="gunzip -c"
+
   has_value "${POSTGRES_USER}" || die "You need to set the POSTGRES_USER environment variable."
   has_value "${POSTGRES_PASSWORD}" || die "You need to set the POSTGRES_PASSWORD environment variable or link to a container named POSTGRES."
 
@@ -88,6 +92,11 @@ validate_common_env() {
 }
 
 setup_aws() {
+  # The AWS CLI stops verifying certificates when AWS_CA_BUNDLE is set but empty.
+  if [ -n "${AWS_CA_BUNDLE+set}" ] && ! has_value "${AWS_CA_BUNDLE}"; then
+    unset AWS_CA_BUNDLE
+  fi
+
   AWS_ARGS=""
   if has_value "${S3_ENDPOINT}"; then
     AWS_ARGS="--endpoint-url ${S3_ENDPOINT}"
