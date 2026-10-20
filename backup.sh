@@ -150,11 +150,8 @@ if has_value "${DELETE_OLDER_THAN}"; then
       [ -n "$fileName" ] || continue
       # Never delete the backup this run just uploaded.
       [ "$fileName" != "$DEST_FILE" ] || continue
-      if [ "${DELETE_MATCH_DATABASE}" = "yes" ]; then
-        case "$fileName" in
-          "${POSTGRES_DATABASE}_"*) ;;
-          *) continue ;;
-        esac
+      if [ "${DELETE_MATCH_DATABASE}" = "yes" ] && ! is_database_backup "$fileName"; then
+        continue
       fi
       created=$(echo "$line" | awk '{print $1" "$2}')
       created=$(date -d "$created" +%s)

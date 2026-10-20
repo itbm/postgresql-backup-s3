@@ -84,7 +84,7 @@ spec:
 
 An empty value is treated the same as an unset variable.
 
-`POSTGRES_USER`, `POSTGRES_PASSWORD`, `S3_ACCESS_KEY_ID`, `S3_SECRET_ACCESS_KEY` and `ENCRYPTION_PASSWORD` can also be read from a file by setting the same name with a `_FILE` suffix, for example `POSTGRES_PASSWORD_FILE=/run/secrets/postgres_password`. This works with Docker and Kubernetes secrets. A trailing newline in the file is ignored. Setting both a variable and its `_FILE` form is an error.
+`POSTGRES_USER`, `POSTGRES_PASSWORD`, `S3_ACCESS_KEY_ID`, `S3_SECRET_ACCESS_KEY` and `ENCRYPTION_PASSWORD` can also be read from a file by setting the same name with a `_FILE` suffix, for example `POSTGRES_PASSWORD_FILE=/run/secrets/postgres_password`. This works with Docker and Kubernetes secrets. A trailing newline in the file is ignored. Setting both a variable and its `_FILE` form is an error, and so is an empty file.
 
 | Variable             | Default   | Required | Description                                                                                                              |
 |----------------------|-----------|----------|--------------------------------------------------------------------------------------------------------------------------|
@@ -113,7 +113,7 @@ An empty value is treated the same as an unset variable.
 | TZ                   | UTC       |          | Time zone for logs, `SCHEDULE` and `DELETE_OLDER_THAN`, for example `Europe/London`. Backup file names always use UTC     |
 | ENCRYPTION_PASSWORD  |           |          | Password to encrypt/decrypt the backup                                                                                   |
 | DELETE_OLDER_THAN    |           |          | Delete old backups, see explanation and warning below                                                                    |
-| DELETE_MATCH_DATABASE | no       |          | Set to `yes` so `DELETE_OLDER_THAN` only deletes files named `<POSTGRES_DATABASE>_*` in `S3_PREFIX`                      |
+| DELETE_MATCH_DATABASE | no       |          | Set to `yes` so `DELETE_OLDER_THAN` only deletes this database's backups, named `<POSTGRES_DATABASE>_<timestamp>`        |
 | USE_CUSTOM_FORMAT    | no        |          | Use PostgreSQL's custom format (-Fc) instead of plain text with compression                                              |
 | COMPRESSION_CMD      | gzip      |          | Command used to compress the backup (e.g. `pigz` for parallel compression) - ignored when USE_CUSTOM_FORMAT=yes          |
 | DECOMPRESSION_CMD    | gunzip -c |          | Command used to decompress the backup (e.g. `pigz -dc` for parallel decompression) - ignored when USE_CUSTOM_FORMAT=yes  |
@@ -180,7 +180,7 @@ More information about the scheduling can be found [here](http://godoc.org/githu
 
 You can additionally set the `DELETE_OLDER_THAN` environment variable like `-e DELETE_OLDER_THAN="30 days ago"` to delete old backups.
 
-WARNING: by default this deletes all files in the S3_PREFIX path, not just those created by this script. Set `-e DELETE_MATCH_DATABASE=yes` to delete only this database's backups (files named `<POSTGRES_DATABASE>_*`). This is recommended when several databases or other files share a prefix.
+WARNING: by default this deletes all files in the S3_PREFIX path, not just those created by this script. Set `-e DELETE_MATCH_DATABASE=yes` to delete only this database's backups: files named `<POSTGRES_DATABASE>_<timestamp>` with a `.sql.gz`, `.dump` or `.enc` extension, as this image names them. This is recommended when several databases or other files share a prefix.
 
 The backup uploaded by the current run is never deleted. A failed delete fails the backup, and the log shows how many files were deleted and kept.
 

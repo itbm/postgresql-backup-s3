@@ -53,15 +53,14 @@ psql_admin() {
 
 # pg_dump 17 and later put "SET transaction_timeout = 0;" in the header of every
 # plain dump, and PostgreSQL 16 and older reject it, which stops a restore with
-# ON_ERROR_STOP. Drops that line from each header (a pg_dump section starts with
-# \restrict or \connect and its header ends at the first statement).
+# ON_ERROR_STOP. Drops that line where pg_dump writes it, right after its other
+# timeout settings in each database's header, so table data and function bodies
+# are never changed.
 strip_transaction_timeout() {
   awk '
-    BEGIN { header = 1 }
-    /^\\(restrict|connect) / { header = 1 }
-    header && $0 == "SET transaction_timeout = 0;" { next }
-    header && !($0 == "" || /^--/ || /^SET / || /^SELECT pg_catalog\.set_config\(/ || /^\\(restrict|unrestrict|connect) /) { header = 0 }
-    { print }
+    $0 == "SET transaction_timeout = 0;" && p1 == "SET idle_in_transaction_session_timeout = 0;" &&
+      p2 == "SET lock_timeout = 0;" && p3 == "SET statement_timeout = 0;" { next }
+    { print; p3 = p2; p2 = p1; p1 = $0 }
   '
 }
 
@@ -92,19 +91,7 @@ resolve_latest_backup() {
       *' PRE '*|'') continue ;;
     esac
     name=$(echo "$line" | awk '{ $1=$2=$3=""; sub(/^ +/, ""); print }')
-    case "$name" in
-      "${POSTGRES_DATABASE}_"*) ;;
-      *) continue ;;
-    esac
-    # Require the timestamp so a database named app does not match app_archive_... backups.
-    rest=${name#"${POSTGRES_DATABASE}_"}
-    case "$rest" in
-      [0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9]Z.sql.gz|\
-      [0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9]Z.sql.gz.enc|\
-      [0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9]Z.dump|\
-      [0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9]Z.dump.enc) ;;
-      *) continue ;;
-    esac
+    is_database_backup "$name" || continue
     echo "$name" >> "$WORK_DIR/candidates"
   done < "$WORK_DIR/s3-listing"
   # UTC ISO 8601 timestamps sort chronologically as strings.

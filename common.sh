@@ -47,6 +47,11 @@ file_env() {
   fi
   # Command substitution drops trailing newlines, which secret files often have.
   _fe_val=$(cat "$_fe_file")
+  # An empty secret would otherwise count as unset and, for example, turn
+  # encryption off.
+  if [ -z "$_fe_val" ]; then
+    die "${_fe_var}_FILE is empty: ${_fe_file}"
+  fi
   eval "$_fe_var=\$_fe_val"
   export "${_fe_var?}"
 }
@@ -130,6 +135,23 @@ setup_aws() {
 setup_postgres() {
   export PGPASSWORD=$POSTGRES_PASSWORD
   POSTGRES_HOST_OPTS="-h $POSTGRES_HOST -p $POSTGRES_PORT -U $POSTGRES_USER $POSTGRES_EXTRA_OPTS"
+}
+
+# Succeeds if file name $1 is a backup of POSTGRES_DATABASE as this image names
+# them: <POSTGRES_DATABASE>_<UTC timestamp>.sql.gz or .dump, optionally .enc.
+# The timestamp stops a database named app matching app_archive_... backups.
+is_database_backup() {
+  case "$1" in
+    "${POSTGRES_DATABASE}_"*) ;;
+    *) return 1 ;;
+  esac
+  case "${1#"${POSTGRES_DATABASE}_"}" in
+    [0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9]Z.sql.gz|\
+    [0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9]Z.sql.gz.enc|\
+    [0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9]Z.dump|\
+    [0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9]Z.dump.enc) ;;
+    *) return 1 ;;
+  esac
 }
 
 make_work_dir() {

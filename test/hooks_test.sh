@@ -620,18 +620,68 @@ else
 fi
 
 # PostgreSQL 16 and older reject the transaction_timeout setting that pg_dump 17
-# and later put in the dump header; table data with the same text is kept.
+# and later write after the other timeouts in each database's header. Only those
+# lines (@TT@ below) are dropped; table data and function bodies are kept. The
+# fixture has a pg_dump 18 header, a -C or pg_dumpall \connect section, and a
+# pg_dumpall section from pg_dump 17.0-17.5, which has no \restrict line.
 reset_logs
 mkdir -p "$WORKDIR/s3/test-bucket/backup"
-printf 'SET lock_timeout = 0;\nSET transaction_timeout = 0;\nCREATE TABLE t (v text);\nCOPY t (v) FROM stdin;\nSET transaction_timeout = 0;\n\\.\n' \
-  | gzip > "$WORKDIR/s3/test-bucket/backup/appdb.sql.gz"
+cat > "$WORKDIR/tt-template.sql" <<'SQL'
+\restrict K
+SET statement_timeout = 0;
+SET lock_timeout = 0;
+SET idle_in_transaction_session_timeout = 0;
+@TT@
+SET client_encoding = 'UTF8';
+CREATE FUNCTION f() RETURNS text LANGUAGE sql AS $$SELECT '
+\connect other
+SET transaction_timeout = 0;
+'$$;
+CREATE TABLE t (v text);
+COPY t (v) FROM stdin;
+SET transaction_timeout = 0;
+\.
+\unrestrict K
+\connect db2
+\restrict K
+SET statement_timeout = 0;
+SET lock_timeout = 0;
+SET idle_in_transaction_session_timeout = 0;
+@TT@
+CREATE TABLE u (v text);
+\unrestrict K
+--
+-- Database "db3" dump
+--
+CREATE DATABASE db3;
+SET statement_timeout = 0;
+SET lock_timeout = 0;
+SET idle_in_transaction_session_timeout = 0;
+@TT@
+SQL
+sed 's/^@TT@$/SET transaction_timeout = 0;/' "$WORKDIR/tt-template.sql" > "$WORKDIR/tt-dump.sql"
+grep -vx '@TT@' "$WORKDIR/tt-template.sql" > "$WORKDIR/tt-expected.sql"
+gzip -c "$WORKDIR/tt-dump.sql" > "$WORKDIR/s3/test-bucket/backup/appdb.sql.gz"
 assert_ok run_script restore.sh BACKUP_FILE=backup/appdb.sql.gz FAKE_PG_VERSION=160004
-assert_eq "$(grep -c 'transaction_timeout' "$WORKDIR/psql.stdin")" "1" "transaction_timeout lines restored into PostgreSQL 16"
+if cmp -s "$WORKDIR/psql.stdin" "$WORKDIR/tt-expected.sql"; then
+  pass
+else
+  fail "restore into PostgreSQL 16 did not drop exactly the header transaction_timeout lines"
+  diff "$WORKDIR/tt-expected.sql" "$WORKDIR/psql.stdin" >&2
+fi
 assert_ok run_script restore.sh BACKUP_FILE=backup/appdb.sql.gz
-assert_eq "$(grep -c 'transaction_timeout' "$WORKDIR/psql.stdin")" "2" "transaction_timeout lines restored into PostgreSQL 18"
+if cmp -s "$WORKDIR/psql.stdin" "$WORKDIR/tt-dump.sql"; then
+  pass
+else
+  fail "restore into PostgreSQL 18 changed the dump"
+fi
 # -x in POSTGRES_EXTRA_OPTS (no privileges for pg_dump) is expanded output for psql.
 assert_ok run_script restore.sh BACKUP_FILE=backup/appdb.sql.gz FAKE_PG_VERSION=160004 POSTGRES_EXTRA_OPTS=-x
-assert_eq "$(grep -c 'transaction_timeout' "$WORKDIR/psql.stdin")" "1" "transaction_timeout lines restored into PostgreSQL 16 with psql -x"
+if cmp -s "$WORKDIR/psql.stdin" "$WORKDIR/tt-expected.sql"; then
+  pass
+else
+  fail "restore into PostgreSQL 16 with psql -x did not drop the header transaction_timeout lines"
+fi
 
 RESTORE_EVENTS="$WORKDIR/restore.events"
 for ev in pre-restore post-restore restore-error; do
@@ -745,6 +795,16 @@ write_old_listing
 assert_ok run_script backup.sh "DELETE_OLDER_THAN=30 days ago" DELETE_MATCH_DATABASE=yes
 assert_eq "$(cat "$WORKDIR/aws-rm.log")" "s3://test-bucket/backup/appdb_2000-01-01T00:00:00Z.sql.gz" "DELETE_MATCH_DATABASE=yes deletes only matching files"
 
+# The timestamp is required, so a database named appdb does not match appdb_archive's backups.
+reset_logs
+cat > "$WORKDIR/s3-ls.txt" <<LS
+2000-01-01 00:00:00         10 appdb_archive_2000-01-01T00:00:00Z.sql.gz
+2000-01-01 00:00:00         10 appdb_2000-01-01T00:00:00Z.dump.enc
+2000-01-01 00:00:00         10 appdb_notes.txt
+LS
+assert_ok run_script backup.sh "DELETE_OLDER_THAN=30 days ago" DELETE_MATCH_DATABASE=yes
+assert_eq "$(cat "$WORKDIR/aws-rm.log")" "s3://test-bucket/backup/appdb_2000-01-01T00:00:00Z.dump.enc" "DELETE_MATCH_DATABASE=yes skips other databases' backups"
+
 # The backup uploaded by this run is never deleted, even if its listed time is old.
 reset_logs
 assert_ok run_script backup.sh "DELETE_OLDER_THAN=30 days ago" FAKE_LS_INCLUDE_UPLOAD=yes
@@ -816,6 +876,16 @@ fi
 # Setting both a variable and its _FILE form is rejected, as is an unreadable file.
 assert_fail run_script backup.sh "POSTGRES_PASSWORD_FILE=$SECRETS/pgpass"
 assert_fail run_script backup.sh POSTGRES_PASSWORD= "POSTGRES_PASSWORD_FILE=$SECRETS/missing"
+
+# An empty secret file is rejected instead of, for example, turning encryption off.
+printf '\n' > "$SECRETS/empty"
+reset_logs
+assert_fail run_script backup.sh "ENCRYPTION_PASSWORD_FILE=$SECRETS/empty"
+if [ -f "$WORKDIR/aws.log" ]; then
+  fail "backup with an empty ENCRYPTION_PASSWORD_FILE still uploaded"
+else
+  pass
+fi
 
 # ENCRYPTION_PASSWORD_FILE encrypts with the file's password.
 reset_logs
