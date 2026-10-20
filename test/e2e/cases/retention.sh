@@ -322,7 +322,6 @@ test_retention_deletes_keys_with_spaces_or_backslashes() {
 
 # Each old key differs from a newer one only in its whitespace.
 test_retention_keys_differing_only_in_whitespace() {
-  xfail "retention rebuilds each key from 'aws s3 ls' with awk field splitting, which drops leading and trailing spaces and turns tabs and runs of spaces into one space: the old key stays and a newer object with the rebuilt name is deleted instead"
   bucket=$(new_bucket) || exit 1
   tab=$'\t'
   _ret_put "$bucket" "backup/ lead.sql.gz" "backup/two  spaces.sql.gz" "backup/tab${tab}x.sql.gz" "backup/trail.sql.gz "
@@ -331,6 +330,7 @@ test_retention_keys_differing_only_in_whitespace() {
   _ret_wait_past "$cutoff"
   _ret_put "$bucket" backup/lead.sql.gz "backup/two spaces.sql.gz" "backup/tab x.sql.gz" backup/trail.sql.gz
 
+  xfail "retention rebuilds each key from 'aws s3 ls' with awk field splitting, which drops leading and trailing spaces and turns tabs and runs of spaces into one space: the old key stays and a newer object with the rebuilt name is deleted instead"
   bk_backup backup "$db" "$bucket" -e "DELETE_OLDER_THAN=@$cutoff"
   assert_rc 0 "backup with DELETE_OLDER_THAN"
   _ret_list "$bucket"
@@ -339,13 +339,13 @@ test_retention_keys_differing_only_in_whitespace() {
 }
 
 test_retention_deletes_file_whose_name_contains_pre() {
-  xfail "retention skips every 'aws s3 ls' line containing ' PRE ' to ignore sub-prefixes, so an old file whose name contains ' PRE ' is never deleted"
   bucket=$(new_bucket) || exit 1
   _ret_put "$bucket" "backup/release PRE 1.sql.gz"
   cutoff=$(_ret_mark)
   db=$(new_db) || exit 1
   _ret_wait_past "$cutoff"
 
+  xfail "retention skips every 'aws s3 ls' line containing ' PRE ' to ignore sub-prefixes, so an old file whose name contains ' PRE ' is never deleted"
   bk_backup backup "$db" "$bucket" -e "DELETE_OLDER_THAN=@$cutoff"
   assert_rc 0 "backup with DELETE_OLDER_THAN"
   _ret_list "$bucket"
@@ -527,26 +527,16 @@ test_retention_invalid_threshold_deletes_nothing() {
   _ret_kept backup/old.sql.gz
 }
 
-# An empty value must not delete anything, whether it disables retention or
-# is rejected.
-test_retention_empty_threshold_deletes_nothing() {
-  xfail "an empty DELETE_OLDER_THAN reaches 'date -d \"\"', which means midnight today, so every object in the prefix from before today is deleted"
-  bucket=$(new_bucket) || exit 1
-  db=$(new_db) || exit 1
-  _ret_put_aged "$bucket" "2 days ago" backup/two-days-old.sql.gz
-
-  bk_backup backup "$db" "$bucket" -e DELETE_OLDER_THAN=
-  _ret_list "$bucket"
-  _ret_kept backup/two-days-old.sql.gz
-}
+# An empty DELETE_OLDER_THAN is covered by
+# test_validation_empty_delete_older_than_deletes_nothing in validation.sh.
 
 # "7 days" (without "ago") is 7 days in the future. Whether that is rejected or
 # not, the backup just uploaded must survive.
 test_retention_future_threshold_keeps_new_backup() {
-  xfail "a threshold in the future, such as '7 days' without 'ago', deletes the backup just uploaded (and everything else in the prefix) while the run exits 0 and reports success"
   bucket=$(new_bucket) || exit 1
   db=$(new_db) || exit 1
 
+  xfail "a threshold in the future, such as '7 days' without 'ago', deletes the backup just uploaded (and everything else in the prefix) while the run exits 0 and reports success"
   bk_backup backup "$db" "$bucket" -e "DELETE_OLDER_THAN=7 days"
   assert_log_not_contains "DELETING ${db}_" "retention deleted the backup it had just uploaded"
   if [ "$BK_RC" = 0 ]; then
