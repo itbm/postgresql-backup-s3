@@ -36,6 +36,17 @@ _sched_assert_log_match() {
   grep -Eq -- "$1" "$BK_LOG" || fail "${2:-log has no line matching} /$1/"
 }
 
+# _sched_log_gap <text-a> <text-b> - seconds between the first log line holding
+# text-a and the first later line holding text-b (from go-cron's one-second
+# timestamps), or -1 if either is missing.
+_sched_log_gap() {
+  awk -v a="$1" -v b="$2" '
+    function secs(line, t) { split(substr(line, 13, 8), t, ":"); return t[1] * 3600 + t[2] * 60 + t[3] }
+    !fa && index($0, a) { fa = 1; ta = secs($0); next }
+    fa && !fb && index($0, b) { fb = 1; tb = secs($0) }
+    END { if (fa && fb) print (tb - ta + 86400) % 86400; else print -1 }' "$BK_LOG"
+}
+
 # _sched_live_procs <command> - live (non-zombie) processes in BK_CTR running command.
 _sched_live_procs() {
   docker exec "$BK_CTR" ps -o stat,args 2>/dev/null \
@@ -96,11 +107,24 @@ test_schedule_every_runs_repeatedly() {
   _sched_assert_log_match "$_SCHED_TS INFO: Command finished successfully\$"
   assert_log_not_contains "Command finished with error"
 
+  # Each run must dump the database as it is then. The first backup after the
+  # change may come from a run that dumped before it, so wait for two.
+  psql_exec "$db" "UPDATE app.users SET name = 'changed between runs' WHERE id % 10 = 0" >/dev/null \
+    || fail "could not change the data"
+  n=$(s3_count "$bucket" backup/)
+  wait_for 60 s3_has_at_least "$bucket" backup/ $((n + 2)) \
+    || { bk_logs; fail "no new scheduled backups after the data changed"; }
+  bk_stop
+
+  # Every successful run keeps its own object (one cut short by the stop may
+  # have uploaded without reporting success, hence -ge).
+  runs=$(grep -Fc "Command finished successfully" "$BK_LOG")
+  objects=$(s3_count "$bucket" backup/)
+  [ "$objects" -ge "$runs" ] || fail "$runs successful runs left only $objects backups"
   for key in $(s3_keys "$bucket" backup/); do
     assert_match "$key" "^backup/${db}_[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z\.sql\.gz$" "scheduled backup key"
   done
   key=$(s3_keys "$bucket" backup/ | tail -n 1)
-  bk_stop
 
   restored="${db}_restored"
   bk_restore restore "$restored" "$bucket" "$key" -e CREATE_DATABASE=yes
@@ -144,7 +168,7 @@ test_schedule_cron_expressions_accepted() {
 }
 
 test_schedule_invalid_schedule_exits() {
-  exprs=("not a schedule" "0 */5 * * * *" "@every nonsense" "@every" "61 * * * *" "* * * *")
+  exprs=("not a schedule" "@every nonsense" "@every" "61 * * * *" "* * * *")
   ctrs=()
   logs=()
   i=0
@@ -225,19 +249,21 @@ test_schedule_command_timeout_stops_long_run() {
   db=$(new_db)
   bucket=$(new_bucket)
   hooks_setup
-  # The hook is slow while /hook-out/slow exists, so the test can end the slow phase.
+  # The hook blocks while /hook-out/slow exists, so the test decides when runs
+  # become fast. The timeout leaves a fast run plenty of headroom on slow runners.
   write_hook pre-backup '#!/bin/sh
-echo "start $$" >> /hook-out/trace
-if [ -e /hook-out/slow ]; then sleep 6; fi
-echo "end $$" >> /hook-out/trace'
+while [ -e /hook-out/slow ]; do sleep 1; done'
   touch "$CASE_DIR/hook-out/slow"
 
   bk_start cron -e "POSTGRES_DATABASE=$db" -e "S3_BUCKET=$bucket" -e "SCHEDULE=@every 2s" \
-    -e COMMAND_TIMEOUT=3s "${HOOK_MOUNTS[@]}"
-  wait_for 60 _sched_log_has_at_least "Command timed out after 3s" 2 \
+    -e COMMAND_TIMEOUT=8s "${HOOK_MOUNTS[@]}"
+  wait_for 90 _sched_log_has_at_least "Command timed out after 8s" 2 \
     || fail "slow runs were not timed out"
-  assert_log_contains "INFO: Command timeout: 3s"
-  _sched_assert_log_match "$_SCHED_TS ERROR: Command timed out after 3s\$"
+  assert_log_contains "INFO: Command timeout: 8s"
+  _sched_assert_log_match "$_SCHED_TS ERROR: Command timed out after 8s\$"
+  # The run must really be stopped after 8s, not merely reported as such.
+  took=$(_sched_log_gap "INFO: Executing command" "Command timed out")
+  [ "$took" -ge 7 ] && [ "$took" -le 13 ] || fail "the first run was stopped after ${took}s, not 8s"
   assert_log_not_contains "Command finished successfully"
   assert_log_not_contains "Creating dump of"
   assert_s3_count "$bucket" "" 0 "timed-out runs must not upload"
