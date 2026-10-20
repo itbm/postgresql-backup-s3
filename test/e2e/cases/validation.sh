@@ -1,5 +1,5 @@
 # Input validation, run.sh dispatch, blank ("") values of the documented
-# variables, README.md/Dockerfile consistency and what the image contains.
+# variables, README.md against the image's defaults, and what the image contains.
 
 # Must match the variables README.md marks as required (checked below).
 _VAL_REQUIRED="S3_BUCKET POSTGRES_DATABASE POSTGRES_HOST POSTGRES_USER POSTGRES_PASSWORD"
@@ -145,19 +145,12 @@ _val_norm() {
     -e "s/^'\\(.*\\)'\$/\\1/" -e 's/^"\(.*\)"$/\1/' -e 's/^`\(.*\)`$/\1/' -e 's/^\*\*None\*\*$//'
 }
 
-# NAME|default for every ENV instruction in the Dockerfile.
-_val_dockerfile_env() {
-  awk '$1 == "ENV" {
-    line = $0
-    sub(/^ENV[ \t]+/, "", line)
-    if (match(line, /^[A-Za-z_][A-Za-z0-9_]*=/)) {
-      name = substr(line, 1, RLENGTH - 1); value = substr(line, RLENGTH + 1)
-    } else {
-      name = line; sub(/[ \t].*$/, "", name)
-      value = line; sub(/^[^ \t]+[ \t]*/, "", value)
-    }
-    print name "|" value
-  }' "$_VAL_ROOT/Dockerfile"
+# NAME|default for every variable the image sets, except the base image's PATH.
+# Read from the built image rather than parsed from the Dockerfile, so any ENV
+# syntax works and the defaults are the ones users actually get.
+_val_image_env() {
+  docker image inspect -f '{{range .Config.Env}}{{println .}}{{end}}' "$E2E_IMAGE" |
+    awk 'NF && !/^PATH=/ { i = index($0, "="); print substr($0, 1, i - 1) "|" substr($0, i + 1) }'
 }
 
 # NAME|default|required for every row of README.md's "Environment variables" table.
@@ -175,28 +168,27 @@ _val_readme_env() {
 # ---------------------------------------------------------------------------
 # Documentation and image.
 
-test_validation_docs_env_table_matches_dockerfile() {
-  _val_dockerfile_env >"$CASE_DIR/dockerfile-env"
+test_validation_docs_env_table_matches_image() {
+  _val_image_env >"$CASE_DIR/image-env" || fail "could not read the environment of $E2E_IMAGE"
   _val_readme_env >"$CASE_DIR/readme-env"
-  [ "$(grep -c . "$CASE_DIR/dockerfile-env")" -ge 10 ] || fail "parsed too few ENV lines from the Dockerfile"
+  [ "$(grep -c . "$CASE_DIR/image-env")" -ge 10 ] || fail "the image sets too few variables"
   [ "$(grep -c . "$CASE_DIR/readme-env")" -ge 10 ] || fail "parsed too few rows from README.md's table"
 
-  cut -d'|' -f1 "$CASE_DIR/dockerfile-env" | LC_ALL=C sort >"$CASE_DIR/dockerfile-names"
+  cut -d'|' -f1 "$CASE_DIR/image-env" | LC_ALL=C sort >"$CASE_DIR/image-names"
   cut -d'|' -f1 "$CASE_DIR/readme-env" | LC_ALL=C sort >"$CASE_DIR/readme-names"
-  assert_eq "$(uniq -d "$CASE_DIR/dockerfile-names" | tr '\n' ' ')" "" "variables set twice in the Dockerfile"
   assert_eq "$(uniq -d "$CASE_DIR/readme-names" | tr '\n' ' ')" "" "variables listed twice in README.md"
-  assert_eq "$(LC_ALL=C comm -23 "$CASE_DIR/dockerfile-names" "$CASE_DIR/readme-names" | tr '\n' ' ')" "" \
-    "Dockerfile ENV variables missing from README.md's table"
-  assert_eq "$(LC_ALL=C comm -13 "$CASE_DIR/dockerfile-names" "$CASE_DIR/readme-names" | tr '\n' ' ')" "" \
-    "README.md table rows with no ENV in the Dockerfile"
+  assert_eq "$(LC_ALL=C comm -23 "$CASE_DIR/image-names" "$CASE_DIR/readme-names" | tr '\n' ' ')" "" \
+    "variables the image sets that README.md's table does not document"
+  assert_eq "$(LC_ALL=C comm -13 "$CASE_DIR/image-names" "$CASE_DIR/readme-names" | tr '\n' ' ')" "" \
+    "README.md table rows the image does not set"
 
   mismatches=""
   while IFS='|' read -r name value; do
     want=$(_val_norm "$value")
     got=$(_val_norm "$(awk -F'|' -v n="$name" '$1 == n { print $2; exit }' "$CASE_DIR/readme-env")")
-    [ "$got" = "$want" ] || mismatches="$mismatches $name (README.md '$got', Dockerfile '$want');"
-  done <"$CASE_DIR/dockerfile-env"
-  assert_eq "$mismatches" "" "README.md defaults that differ from the Dockerfile"
+    [ "$got" = "$want" ] || mismatches="$mismatches $name (README.md '$got', image '$want');"
+  done <"$CASE_DIR/image-env"
+  assert_eq "$mismatches" "" "README.md defaults that differ from the image's"
 
   required=$(awk -F'|' '$3 == "Y" { print $1 }' "$CASE_DIR/readme-env" | LC_ALL=C sort | tr '\n' ' ')
   assert_eq "$required" "$(printf '%s\n' $_VAL_REQUIRED | LC_ALL=C sort | tr '\n' ' ')" \
@@ -209,7 +201,7 @@ test_validation_docs_env_table_matches_dockerfile() {
     sed -n 's/^ *- name: \([A-Z][A-Z0-9_]*\) *$/\1/p' "$_VAL_ROOT/README.md"
   } | LC_ALL=C sort -u >"$CASE_DIR/example-names"
   [ -s "$CASE_DIR/example-names" ] || fail "found no variables in README.md's examples"
-  assert_eq "$(LC_ALL=C comm -23 "$CASE_DIR/example-names" "$CASE_DIR/dockerfile-names" | tr '\n' ' ')" "" \
+  assert_eq "$(LC_ALL=C comm -23 "$CASE_DIR/example-names" "$CASE_DIR/image-names" | tr '\n' ' ')" "" \
     "variables in README.md's examples that the image does not define"
 }
 
@@ -217,8 +209,11 @@ test_validation_image_contents() {
   assert_eq "$(docker image inspect -f '{{json .Config.Cmd}}' "$E2E_IMAGE")" '["sh","run.sh"]' "image CMD"
   assert_eq "$(docker image inspect -f '{{json .Config.Entrypoint}}' "$E2E_IMAGE")" "null" "image ENTRYPOINT"
 
+  # A hook must not be able to change anything root runs later: the scripts,
+  # /hooks, programs on PATH (including PATH directories that do not exist yet),
+  # trusted CAs or root's AWS configuration.
   bk_run probe -- sh -c '
-    [ -f run.sh ] && echo "cmd_dir=$(pwd)"
+    for f in run.sh backup.sh restore.sh hooks.sh; do [ -f "$f" ] && echo "script=$f"; done
     for b in pg_dump psql pg_restore pg_dumpall; do echo "client=$($b --version)"; done
     for b in aws openssl pigz curl su-exec go-cron gzip gunzip; do
       command -v "$b" >/dev/null && echo "tool=$b"
@@ -228,19 +223,27 @@ test_validation_image_contents() {
     echo "hook_ids=$(id -u hook) $(id -g hook) $(id -G hook)"
     echo "su_exec_uid=$(su-exec hook id -u)"
     echo "hooks_dir=$(stat -c "%U:%G %a" /hooks)"
-    for f in /hooks/probe /run.sh /backup.sh /restore.sh /hooks.sh; do
-      su-exec hook sh -c ": >> $f" 2>/dev/null && echo "hook_writes=$f"
+    w=${PWD%/}
+    for f in /hooks/probe "$w/run.sh" "$w/backup.sh" "$w/restore.sh" "$w/hooks.sh" \
+      "$(command -v go-cron)" /usr/local/share/ca-certificates/probe.crt /root/probe; do
+      su-exec hook sh -c ": >> \"\$1\"" sh "$f" 2>/dev/null && echo "hook_writes=$f"
     done
+    for d in $(printf "%s" "$PATH" | tr ":" " "); do
+      su-exec hook sh -c "mkdir -p \"\$1\" && : > \"\$1/probe\"" sh "$d" 2>/dev/null && echo "hook_writes=$d"
+    done
+    find / -xdev \( -perm -4000 -o -perm -2000 \) -type f 2>/dev/null | sed "s/^/setid=/"
     echo "go_cron=$(go-cron 2>&1 | head -n 1)"
   '
   assert_rc 0 "image probe"
 
-  assert_eq "$(_val_probe cmd_dir)" "/" "working directory holding run.sh"
+  assert_eq "$(_val_probe script | tr '\n' ' ')" "run.sh backup.sh restore.sh hooks.sh " \
+    "scripts in the working directory, where CMD runs run.sh"
 
   readme_pg=$(sed -n 's/.*ships the PostgreSQL \([0-9][0-9]*\) client.*/\1/p' "$_VAL_ROOT/README.md" | head -n 1)
-  assert_eq "$readme_pg" 18 "PostgreSQL client major version README.md states"
+  [ -n "$readme_pg" ] || fail "README.md does not say which PostgreSQL client the image ships"
   for b in pg_dump psql pg_restore pg_dumpall; do
-    assert_match "$(_val_probe client | grep "^$b ")" "^$b \(PostgreSQL\) 18(\.[0-9]+)+$" "$b version"
+    assert_match "$(_val_probe client | grep "^$b ")" "^$b \(PostgreSQL\) $readme_pg(\.[0-9]+)+$" \
+      "$b version (README.md says PostgreSQL $readme_pg)"
   done
   for b in aws openssl pigz curl su-exec go-cron gzip gunzip; do
     assert_eq "$(_val_probe tool | grep -Fx -- "$b")" "$b" "$b on PATH"
@@ -266,6 +269,38 @@ test_validation_image_contents() {
   assert_eq "$(_val_probe su_exec_uid)" "$hook_uid" "uid after su-exec hook"
   assert_eq "$(_val_probe hooks_dir)" "root:root 755" "owner and mode of /hooks"
   assert_eq "$(_val_probe hook_writes | tr '\n' ' ')" "" "paths the hook user can write"
+  # A setuid su-exec, for example, would let a hook run 'su-exec root'.
+  assert_eq "$(_val_probe setid | tr '\n' ' ')" "" "setuid or setgid files the hook user could use"
+}
+
+# Root keeps temporary files in /tmp, which the hook user can write too. With
+# ENCRYPTION_PASSWORD and DELETE_OLDER_THAN set, backup.sh writes
+# /tmp/dump.sql.gz.enc and /tmp/s3-listing after the pre-backup hook has run;
+# symlinks planted there must not make root overwrite other files.
+test_validation_hook_cannot_redirect_root_temp_files() {
+  xfail "backup.sh writes /tmp/dump.sql.gz.enc and /tmp/s3-listing as root without removing what is already there, so symlinks planted by a pre-backup hook make root overwrite any file"
+  if [ "$(docker run --rm --label "e2e.run=$E2E_RUN_ID" --entrypoint cat "$E2E_IMAGE" /proc/sys/fs/protected_symlinks)" != 0 ]; then
+    skip "the kernel stops root following other users' symlinks in /tmp (fs.protected_symlinks)"
+  fi
+  _val_begin
+  db=$(_val_db) || exit 1
+  bucket=$(new_bucket) || exit 1
+  hooks_setup
+  write_hook pre-backup '#!/bin/sh
+ln -s /etc/motd /tmp/dump.sql.gz.enc && ln -s /etc/issue /tmp/s3-listing && echo planted >>/hook-out/events'
+
+  bk_backup backup "$db" "$bucket" "${HOOK_MOUNTS[@]}" -e ENCRYPTION_PASSWORD=e2e-secret \
+    -e "DELETE_OLDER_THAN=1 day ago" -- sh -c '
+      before=$(md5sum /etc/motd /etc/issue)
+      sh run.sh
+      rc=$?
+      [ "$(md5sum /etc/motd /etc/issue)" = "$before" ] && echo "root_files=unchanged"
+      exit "$rc"'
+  assert_eq "$(hook_events)" planted "symlinks planted by the pre-backup hook"
+  assert_eq "$(_val_probe root_files)" unchanged "/etc/motd and /etc/issue after the backup"
+  assert_rc 0 "backup with planted symlinks"
+  assert_log_contains "Checking for files older than 1 day ago"
+  assert_match "$(s3_single_key "$bucket" backup/)" "^backup/${db}_${_VAL_TS}\.sql\.gz\.enc$" "encrypted backup key"
 }
 
 # ---------------------------------------------------------------------------
@@ -396,6 +431,17 @@ test_validation_s3_key_pair_must_be_complete() {
   assert_rc 1 "restore with S3_SECRET_ACCESS_KEY only"
   assert_log_contains "You need to set the S3_ACCESS_KEY_ID environment variable."
   assert_log_not_contains "Downloading backup file"
+  # restore.sh has its own copy of the check, so the blank variants too.
+  bk_restore restore-key-blank-secret "$db" "$bucket" backup/any.sql.gz --unset S3_SECRET_ACCESS_KEY \
+    -e S3_SECRET_ACCESS_KEY= -e DROP_DATABASE=yes "${VAL_HOOK_ARGS[@]}"
+  assert_rc 1 "restore with S3_ACCESS_KEY_ID and an empty S3_SECRET_ACCESS_KEY"
+  assert_log_contains "You need to set the S3_SECRET_ACCESS_KEY environment variable."
+  assert_log_not_contains "Downloading backup file"
+  bk_restore restore-blank-key-secret "$db" "$bucket" backup/any.sql.gz --unset S3_ACCESS_KEY_ID \
+    -e S3_ACCESS_KEY_ID= -e DROP_DATABASE=yes "${VAL_HOOK_ARGS[@]}"
+  assert_rc 1 "restore with an empty S3_ACCESS_KEY_ID and S3_SECRET_ACCESS_KEY"
+  assert_log_contains "You need to set the S3_ACCESS_KEY_ID environment variable."
+  assert_log_not_contains "Downloading backup file"
 
   _val_assert_no_hooks "after half key pairs"
   assert_s3_count "$bucket" "" 0 "objects uploaded with half a key pair"
@@ -505,11 +551,14 @@ test_validation_empty_optional_values_behave_like_defaults() {
   if docker cp "$BK_CTR:/root/.aws/config" "$CASE_DIR/aws-config" >/dev/null 2>&1; then
     fail "an empty S3_S3V4 wrote /root/.aws/config: $(cat "$CASE_DIR/aws-config")"
   fi
-  # HOOKS_DIR="" still finds /hooks; HOOK_INHERIT_ENV="" keeps the scrubbed environment.
+  # HOOKS_DIR="" still finds /hooks; HOOK_INHERIT_ENV="" keeps the scrubbed
+  # environment and the unprivileged hook user.
   assert_eq "$(hook_events)" "pre-backup post-backup" "hook scripts with an empty HOOKS_DIR"
   assert_file_contains "$CASE_DIR/hook-out/pre-backup.env" "HOOK_EVENT=pre-backup"
   assert_file_not_contains "$CASE_DIR/hook-out/pre-backup.env" "POSTGRES_PASSWORD=" "password passed to a hook"
   assert_file_not_contains "$CASE_DIR/hook-out/pre-backup.env" "S3_SECRET_ACCESS_KEY=" "S3 secret passed to a hook"
+  assert_match "$(cat "$CASE_DIR/hook-out/pre-backup.uid" 2>/dev/null)" '^[1-9][0-9]*$' \
+    "uid of a hook script (not root)"
 
   restored="${db}_copy"
   _val_track "$restored"
