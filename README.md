@@ -226,6 +226,8 @@ $ docker run ... -e PARALLEL_JOBS=4 -e BACKUP_FILE=backup/dbname_0000-00-00T00:0
 
 Note: Custom format is not available when using `POSTGRES_DATABASE=all` as pg_dumpall does not support this format.
 
+Note: Plain backups made by `pg_dump` 17 or later contain `SET transaction_timeout = 0;`, which PostgreSQL 16 and older reject. When restoring into those servers, that line is skipped.
+
 ### Lifecycle hooks
 
 Optional hooks run at backup and restore lifecycle points. They are **not** shell snippets from the environment: a URL is requested with `curl` as an argument list, and custom logic is an executable file you mount. That avoids treating a ConfigMap or chart value as root shell.

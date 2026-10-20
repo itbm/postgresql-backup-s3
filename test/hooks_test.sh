@@ -613,6 +613,17 @@ else
   cat "$WORKDIR/psql.log" >&2
 fi
 
+# PostgreSQL 16 and older reject the transaction_timeout setting that pg_dump 17
+# and later put in the dump header; table data with the same text is kept.
+reset_logs
+mkdir -p "$WORKDIR/s3/test-bucket/backup"
+printf 'SET lock_timeout = 0;\nSET transaction_timeout = 0;\nCREATE TABLE t (v text);\nCOPY t (v) FROM stdin;\nSET transaction_timeout = 0;\n\\.\n' \
+  | gzip > "$WORKDIR/s3/test-bucket/backup/appdb.sql.gz"
+assert_ok run_script restore.sh BACKUP_FILE=backup/appdb.sql.gz FAKE_PG_VERSION=160004
+assert_eq "$(grep -c 'transaction_timeout' "$WORKDIR/psql.stdin")" "1" "transaction_timeout lines restored into PostgreSQL 16"
+assert_ok run_script restore.sh BACKUP_FILE=backup/appdb.sql.gz
+assert_eq "$(grep -c 'transaction_timeout' "$WORKDIR/psql.stdin")" "2" "transaction_timeout lines restored into PostgreSQL 18"
+
 RESTORE_EVENTS="$WORKDIR/restore.events"
 for ev in pre-restore post-restore restore-error; do
   printf '#! /bin/sh\necho "$1" >> "%s"\n' "$RESTORE_EVENTS" > "$HOOKS_DIR/$ev"

@@ -51,6 +51,30 @@ psql_admin() {
   psql $POSTGRES_HOST_OPTS -d postgres -v ON_ERROR_STOP=1 -Atq -c "$1"
 }
 
+# pg_dump 17 and later put "SET transaction_timeout = 0;" in the header of every
+# plain dump, and PostgreSQL 16 and older reject it, which stops a restore with
+# ON_ERROR_STOP. Drops that line from each header (a pg_dump section starts with
+# \restrict or \connect and its header ends at the first statement).
+strip_transaction_timeout() {
+  awk '
+    BEGIN { header = 1 }
+    /^\\(restrict|connect) / { header = 1 }
+    header && $0 == "SET transaction_timeout = 0;" { next }
+    header && !($0 == "" || /^--/ || /^SET / || /^SELECT pg_catalog\.set_config\(/ || /^\\(restrict|unrestrict|connect) /) { header = 0 }
+    { print }
+  '
+}
+
+# Writes the plain SQL backup to stdout, ready for psql on a server whose
+# server_version_num is $1.
+plain_sql() {
+  if [ "$1" -lt 170000 ]; then
+    $DECOMPRESSION_CMD "$DOWNLOAD_PATH" | strip_transaction_timeout
+  else
+    $DECOMPRESSION_CMD "$DOWNLOAD_PATH"
+  fi
+}
+
 # Sets BACKUP_FILE to the newest <POSTGRES_DATABASE>_<timestamp> backup in S3_PREFIX.
 resolve_latest_backup() {
   echo "Finding the latest backup of ${POSTGRES_DATABASE} in ${S3_BASE_URI}"
@@ -193,10 +217,12 @@ case "$DOWNLOAD_PATH" in
   *.sql.gz)
     if [ "${POSTGRES_DATABASE}" = "all" ]; then
       echo "Restoring all databases"
-      $DECOMPRESSION_CMD "$DOWNLOAD_PATH" | psql $POSTGRES_HOST_OPTS $PSQL_RESTORE_OPTS -d postgres
+      version=$(psql $POSTGRES_HOST_OPTS -d postgres -Atq -c "SHOW server_version_num")
+      plain_sql "$version" | psql $POSTGRES_HOST_OPTS $PSQL_RESTORE_OPTS -d postgres
     else
       echo "Restoring database ${POSTGRES_DATABASE}"
-      $DECOMPRESSION_CMD "$DOWNLOAD_PATH" | psql $POSTGRES_HOST_OPTS $PSQL_RESTORE_OPTS -d "$POSTGRES_DATABASE"
+      version=$(psql $POSTGRES_HOST_OPTS -d "$POSTGRES_DATABASE" -Atq -c "SHOW server_version_num")
+      plain_sql "$version" | psql $POSTGRES_HOST_OPTS $PSQL_RESTORE_OPTS -d "$POSTGRES_DATABASE"
     fi
     ;;
   *.dump)
