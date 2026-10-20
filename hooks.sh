@@ -286,6 +286,16 @@ hook_run_script() {
   if hook_has_value "$BACKUP_FILE"; then
     set -- "$@" "BACKUP_FILE=$BACKUP_FILE"
   fi
+  if hook_has_value "$BACKUP_SIZE_BYTES"; then
+    set -- "$@" "BACKUP_SIZE_BYTES=$BACKUP_SIZE_BYTES"
+  fi
+  # W3C trace context from go-cron in the -otel image; not secret.
+  if hook_has_value "$TRACEPARENT"; then
+    set -- "$@" "TRACEPARENT=$TRACEPARENT"
+  fi
+  if hook_has_value "$TRACESTATE"; then
+    set -- "$@" "TRACESTATE=$TRACESTATE"
+  fi
   case "$_hook_event" in
     *-error)
       if [ -n "$HOOK_EXIT_CODE" ]; then

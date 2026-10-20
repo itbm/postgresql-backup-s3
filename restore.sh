@@ -93,15 +93,21 @@ restore_on_exit() {
   rc=$?
   trap - EXIT
   set +e
+  # A phase still open here was interrupted; it ends with the exit code.
+  phase_end "$rc"
   if [ -n "$WORK_DIR" ]; then
     echo "Cleaning up temporary files"
   fi
   remove_work_dir
   if [ "$rc" -ne 0 ]; then
+    phase_begin restore-error
     run_error_hooks restore-error "$rc"
+    phase_end 0
   fi
+  print_result_line restore "$rc"
   exit "$rc"
 }
+RUN_START_NS=$(now_ns)
 trap restore_on_exit EXIT
 # Turn SIGTERM/SIGINT into a normal exit so the EXIT trap cleans up and fires error hooks.
 trap 'exit 143' TERM
@@ -110,19 +116,28 @@ trap 'exit 130' INT
 make_work_dir
 
 if [ "$BACKUP_FILE" = "latest" ]; then
+  phase_begin resolve
   resolve_latest_backup
+  phase_end
 fi
 
 LOCAL_FILE=$(basename "$BACKUP_FILE")
 DOWNLOAD_PATH="$WORK_DIR/$LOCAL_FILE"
 
+phase_begin pre-restore
 run_hooks pre-restore
+phase_end
 
 echo "Downloading backup file from S3: s3://${S3_BUCKET}/${BACKUP_FILE}"
+report_set s3.key "$BACKUP_FILE"
+phase_begin download
 aws $AWS_ARGS s3 cp "s3://${S3_BUCKET}/${BACKUP_FILE}" "$DOWNLOAD_PATH" || exit 2
+phase_end
 
 case "$LOCAL_FILE" in
   *.enc)
+    report_set encrypted yes
+    phase_begin decrypt
     if ! has_value "${ENCRYPTION_PASSWORD}"; then
       echo "Backup file is encrypted. You need to set the ENCRYPTION_PASSWORD environment variable."
       exit 1
@@ -141,11 +156,16 @@ case "$LOCAL_FILE" in
     fi
     rm -f "$ENCRYPTED_PATH"
     DOWNLOAD_PATH=$DECRYPTED_PATH
+    phase_end
+    ;;
+  *)
+    report_set encrypted no
     ;;
 esac
 
 case "$DOWNLOAD_PATH" in
-  *.sql.gz|*.dump) ;;
+  *.sql.gz) report_set dump.format plain ;;
+  *.dump) report_set dump.format custom ;;
   *)
     echo "ERROR: Unsupported backup format. Expected *.sql.gz or *.dump file."
     exit 1
@@ -155,6 +175,7 @@ esac
 echo "Restoring database ${POSTGRES_DATABASE} on ${POSTGRES_HOST}"
 
 if [ "${DROP_DATABASE}" = "yes" ]; then
+  phase_begin drop
   if [ "${POSTGRES_DATABASE}" = "all" ]; then
     echo "Cannot drop all databases. Please specify a single database to drop."
     exit 1
@@ -170,9 +191,11 @@ if [ "${DROP_DATABASE}" = "yes" ]; then
     echo "ERROR: Failed to drop database ${POSTGRES_DATABASE}."
     exit 1
   fi
+  phase_end
 fi
 
 if [ "${CREATE_DATABASE}" = "yes" ]; then
+  phase_begin create
   if [ "${POSTGRES_DATABASE}" = "all" ]; then
     echo "Cannot create all databases. Please specify a single database to create."
     exit 1
@@ -187,8 +210,10 @@ if [ "${CREATE_DATABASE}" = "yes" ]; then
       exit 1
     fi
   fi
+  phase_end
 fi
 
+phase_begin restore
 case "$DOWNLOAD_PATH" in
   *.sql.gz)
     if [ "${POSTGRES_DATABASE}" = "all" ]; then
@@ -213,9 +238,12 @@ case "$DOWNLOAD_PATH" in
     fi
     ;;
 esac
+phase_end
 
 echo "Database restore completed successfully"
 
+phase_begin post-restore
 run_hooks post-restore
+phase_end
 
 >&2 echo "-----"
