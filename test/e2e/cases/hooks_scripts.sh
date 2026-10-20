@@ -142,7 +142,11 @@ test_hookscripts_backup_success_events_args_and_uid() {
   done
   _hs_assert_log_order "Running script hook for pre-backup" "Creating dump of $db database"
   _hs_assert_log_order "SQL backup finished" "Running script hook for post-backup"
-  assert_s3_count "$bucket" "backup/" 1
+  key=$(s3_single_key "$bucket" "backup/") || fail "expected one backup"
+  _hs_assert_env_absent pre-backup BACKUP_DEST_FILE
+  _hs_assert_env_absent pre-backup BACKUP_S3_URI
+  _hs_assert_env post-backup BACKUP_DEST_FILE "${key#backup/}"
+  _hs_assert_env post-backup BACKUP_S3_URI "s3://$bucket/$key"
 }
 
 test_hookscripts_backup_upload_failure_fires_backup_error() {
@@ -205,7 +209,10 @@ test_hookscripts_scheduled_runs_fire_hooks_each_time() {
   db=$(new_db)
   bucket=$(new_bucket)
   hooks_setup
-  _hs_record pre-backup post-backup backup-error
+  _hs_record pre-backup backup-error
+  write_hook post-backup "$_HS_RECORDER
+echo \"hs-sched-stdout from \$1\"
+echo \"hs-sched-stderr from \$1\" >&2"
 
   bk_start sched "${HOOK_MOUNTS[@]}" -e "POSTGRES_DATABASE=$db" -e "S3_BUCKET=$bucket" \
     -e "SCHEDULE=@every 2s"
@@ -220,6 +227,9 @@ test_hookscripts_scheduled_runs_fire_hooks_each_time() {
   esac
   assert_eq "$(_hs_count_event backup-error)" 0 "backup-error events"
   assert_log_contains "Running script hook for post-backup"
+  # The hook's own stdout and stderr must come through go-cron.
+  assert_log_contains "hs-sched-stdout from post-backup"
+  assert_log_contains "hs-sched-stderr from post-backup"
   s3_has_at_least "$bucket" "backup/" 2 || fail "expected at least two scheduled backups"
 }
 
@@ -300,18 +310,30 @@ test_hookscripts_env_is_scrubbed_on_error_events() {
   _hs_assert_env restore-error HOOK_EXIT_CODE 2
 }
 
-test_hookscripts_post_backup_names_custom_format_encrypted_key() {
+test_hookscripts_post_backup_names_custom_format_keys() {
   db=$(new_db)
   bucket=$(new_bucket)
   hooks_setup
   _hs_record pre-backup post-backup
 
-  bk_backup backup "$db" "$bucket" "${HOOK_MOUNTS[@]}" -e USE_CUSTOM_FORMAT=yes \
+  # Plain and encrypted custom-format backups name the object in different places.
+  bk_backup plain "$db" "$bucket" "${HOOK_MOUNTS[@]}" -e USE_CUSTOM_FORMAT=yes -e S3_PREFIX=plain
+  assert_rc 0 "custom format backup"
+  assert_eq "$(hook_events)" "pre-backup post-backup" "hook events"
+  key=$(s3_single_key "$bucket" "plain/") || fail "expected one plain backup"
+  assert_match "$key" "^plain/${db}_[0-9TZ:-]+\.dump$" "backup key"
+  _hs_assert_env post-backup BACKUP_DEST_FILE "${key#plain/}"
+  _hs_assert_env post-backup BACKUP_S3_URI "s3://$bucket/$key"
+  _hs_assert_env_absent pre-backup BACKUP_DEST_FILE
+
+  rm -f "$CASE_DIR"/hook-out/*
+  bk_backup enc "$db" "$bucket" "${HOOK_MOUNTS[@]}" -e USE_CUSTOM_FORMAT=yes -e S3_PREFIX=enc \
     -e "ENCRYPTION_PASSWORD=$_HS_ENC_PASSWORD"
   assert_rc 0 "custom format encrypted backup"
-  key=$(s3_single_key "$bucket" "backup/") || fail "expected one backup"
-  assert_match "$key" "^backup/${db}_[0-9TZ:-]+\.dump\.enc$" "backup key"
-  _hs_assert_env post-backup BACKUP_DEST_FILE "${key#backup/}"
+  assert_eq "$(hook_events)" "pre-backup post-backup" "hook events"
+  key=$(s3_single_key "$bucket" "enc/") || fail "expected one encrypted backup"
+  assert_match "$key" "^enc/${db}_[0-9TZ:-]+\.dump\.enc$" "backup key"
+  _hs_assert_env post-backup BACKUP_DEST_FILE "${key#enc/}"
   _hs_assert_env post-backup BACKUP_S3_URI "s3://$bucket/$key"
   _hs_assert_env_absent pre-backup BACKUP_DEST_FILE
   _hs_assert_env_absent pre-backup BACKUP_S3_URI
