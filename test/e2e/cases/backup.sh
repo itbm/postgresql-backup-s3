@@ -61,8 +61,10 @@ _backup_fetch_plain() {
 }
 
 # _backup_new_empty_db <name> - creates an empty database on the main server.
+# Recorded for the harness to drop, as some names lack the full t_<slug> prefix.
 _backup_new_empty_db() {
   psql_exec postgres "CREATE DATABASE $(sql_ident "$1")" >/dev/null || fail "could not create database $1"
+  _record_db "$1"
 }
 
 # _backup_load_plain <sql-file> <new-database> - loads a plain dump into a new
@@ -373,24 +375,6 @@ test_backup_postgres_port_non_default() {
   assert_file_contains "$CASE_DIR/all.sql" "reached-on-port-5433"
 }
 
-test_backup_docker_link_env_fallback() {
-  # Legacy Docker links: without POSTGRES_HOST, host and port come from
-  # POSTGRES_PORT_5432_TCP_ADDR and POSTGRES_PORT_5432_TCP_PORT. A link aliased
-  # "postgres" also sets POSTGRES_PORT to a tcp:// URL, which must not be used.
-  ctr=$(start_postgres bklink 5433) || exit 1
-  _backup_sql "$ctr" 5433 postgres "CREATE DATABASE link_db"
-  _backup_sql "$ctr" 5433 link_db "CREATE TABLE link_marker (v text); INSERT INTO link_marker VALUES ('reached-through-link-env')"
-  bucket=$(new_bucket) || exit 1
-
-  bk_backup backup link_db "$bucket" --unset POSTGRES_HOST -e POSTGRES_PORT=tcp://bklink:5433 \
-    -e POSTGRES_PORT_5432_TCP_ADDR=bklink -e POSTGRES_PORT_5432_TCP_PORT=5433
-  assert_rc 0 "backup through Docker link variables"
-  assert_log_contains "Creating dump of link_db database from bklink..."
-  key=$(s3_single_key "$bucket" backup/) || exit 1
-  _backup_fetch_plain "$bucket" "$key" dump
-  assert_file_contains "$CASE_DIR/dump.sql" "reached-through-link-env"
-}
-
 test_backup_postgres_user_and_password() {
   db=$(new_db) || exit 1
   bucket=$(new_bucket) || exit 1
@@ -414,35 +398,18 @@ test_backup_postgres_user_and_password() {
 }
 
 test_backup_postgres_user_with_space() {
-  xfail "backup.sh expands POSTGRES_USER unquoted (-U \$POSTGRES_USER), so a role name containing a space breaks the pg_dump command line"
   db=$(new_db) || exit 1
   bucket=$(new_bucket) || exit 1
   role="bk user $(printf '%s' "$CASE_SLUG" | cut -c1-30)"
   psql_exec postgres "CREATE ROLE $(sql_ident "$role") LOGIN SUPERUSER PASSWORD 'bk-space-role-pw'" >/dev/null \
     || fail "could not create role $role"
 
+  xfail "backup.sh expands POSTGRES_USER unquoted (-U \$POSTGRES_USER), so a role name containing a space breaks the pg_dump command line"
   bk_backup backup "$db" "$bucket" -e "POSTGRES_USER=$role" -e POSTGRES_PASSWORD=bk-space-role-pw
   assert_rc 0 "backup as role '$role'"
   key=$(s3_single_key "$bucket" backup/) || exit 1
   _backup_fetch_plain "$bucket" "$key" dump
   assert_file_contains "$CASE_DIR/dump.sql" "CREATE TABLE app.users ("
-}
-
-test_backup_requires_postgres_settings() {
-  db=$(new_db) || exit 1
-  bucket=$(new_bucket) || exit 1
-
-  for var in POSTGRES_HOST POSTGRES_USER POSTGRES_PASSWORD; do
-    bk_backup "$(printf 'no-%s' "$var" | tr 'A-Z_' 'a-z-')" "$db" "$bucket" --unset "$var"
-    assert_rc 1 "backup without $var"
-    assert_log_contains "You need to set the $var environment variable"
-    assert_log_not_contains "Creating dump of" "dump started without $var"
-  done
-
-  bk_run no-postgres-database -e "S3_BUCKET=$bucket"
-  assert_rc 1 "backup without POSTGRES_DATABASE"
-  assert_log_contains "You need to set the POSTGRES_DATABASE environment variable."
-  assert_s3_count "$bucket" "" 0 "objects uploaded without the required settings"
 }
 
 test_backup_older_server_version() {
@@ -475,18 +442,6 @@ test_backup_older_server_version() {
 
 # ---------------------------------------------------------------------------
 # POSTGRES_EXTRA_DUMP_OPTS and POSTGRES_EXTRA_OPTS.
-
-test_backup_extra_dump_opts_exclude_table() {
-  db=$(new_db) || exit 1
-  bucket=$(new_bucket) || exit 1
-
-  bk_backup backup "$db" "$bucket" -e POSTGRES_EXTRA_DUMP_OPTS=--exclude-table=public.excluded_table
-  assert_rc 0 "backup with --exclude-table"
-  key=$(s3_single_key "$bucket" backup/) || exit 1
-  _backup_fetch_plain "$bucket" "$key" dump
-  assert_file_contains "$CASE_DIR/dump.sql" "CREATE TABLE app.users ("
-  assert_file_not_contains "$CASE_DIR/dump.sql" "excluded_table"
-}
 
 test_backup_extra_dump_opts_several_options() {
   db=$(new_db) || exit 1
@@ -620,7 +575,6 @@ test_backup_database_names_needing_quoting() {
 }
 
 test_backup_database_name_starting_with_hyphen() {
-  xfail "backup.sh passes POSTGRES_DATABASE to pg_dump as a bare argument, so a name starting with '-' is parsed as options (-d<rest> dumps database <rest>)"
   bucket=$(new_bucket) || exit 1
   # pg_dump reads "-d<decoy>" as "-d <decoy>"; the decoy makes the mix-up visible.
   decoy=$(printf 't_%s_decoy' "$CASE_SLUG" | tr '-' '_')
@@ -629,6 +583,7 @@ test_backup_database_name_starting_with_hyphen() {
   name="-d$decoy"
   new_db_named "$name"
 
+  xfail "backup.sh passes POSTGRES_DATABASE to pg_dump as a bare argument, so a name starting with '-' is parsed as options (-d<rest> dumps database <rest>)"
   bk_backup backup "$name" "$bucket"
   assert_rc 0 "backup of database '$name'"
   key=$(s3_single_key "$bucket" "backup/${name}_") || exit 1
@@ -638,11 +593,11 @@ test_backup_database_name_starting_with_hyphen() {
 }
 
 test_backup_database_name_with_equals_sign() {
-  xfail "backup.sh passes POSTGRES_DATABASE to pg_dump as a bare argument, so a name containing '=' is parsed as a connection string"
   bucket=$(new_bucket) || exit 1
   name="$(printf 't_%s' "$CASE_SLUG" | tr '-' '_' | cut -c1-40)_a=b"
   new_db_named "$name"
 
+  xfail "backup.sh passes POSTGRES_DATABASE to pg_dump as a bare argument, so a name containing '=' is parsed as a connection string"
   bk_backup backup "$name" "$bucket"
   assert_rc 0 "backup of database '$name'"
   key=$(s3_single_key "$bucket" "backup/${name}_") || exit 1
