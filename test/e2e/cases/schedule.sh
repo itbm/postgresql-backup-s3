@@ -132,11 +132,35 @@ test_schedule_every_runs_repeatedly() {
   assert_same_data "$db" "$restored"
 }
 
+# The only test that waits for a minute: a standard 5-field expression must
+# really fire, at the start of a minute and only once in it.
+test_schedule_standard_cron_expression_fires() {
+  db=$(new_db)
+  bucket=$(new_bucket)
+
+  bk_start cron -e "POSTGRES_DATABASE=$db" -e "S3_BUCKET=$bucket" -e "SCHEDULE=* * * * *"
+  wait_for 80 s3_has_at_least "$bucket" backup/ 1 \
+    || { bk_logs; fail "no backup within 80s with SCHEDULE='* * * * *'"; }
+  wait_for 30 _sched_log_has_at_least "Command finished successfully" 1 || fail "the run did not report success"
+  _sched_running || fail "scheduled container is no longer running"
+
+  assert_log_contains "INFO: Cron job scheduled: * * * * *"
+  assert_eq "$(grep -Fc "INFO: Executing command" "$BK_LOG")" 1 "runs in the first minute"
+  assert_log_not_contains "Previous command still running"
+  assert_s3_count "$bucket" backup/ 1 "backups in the first minute"
+  started=$(grep -F -m 1 "INFO: Executing command" "$BK_LOG" | cut -c19-20)
+  assert_match "$started" '^[0-9][0-9]$' "seconds of the first run's start"
+  [ "$started" -le 5 ] || fail "the first run started at second $started of the minute, not at its start"
+  key=$(s3_single_key "$bucket" backup/)
+  assert_match "$key" "^backup/${db}_[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z\.sql\.gz$" "scheduled backup key"
+}
+
 test_schedule_cron_expressions_accepted() {
   db=$(new_db)
   bucket=$(new_bucket)
 
-  exprs=("*/5 * * * *" "0 3 * * 1-5" "@daily" "@hourly" "@weekly" "@midnight" "@every 1h30m")
+  exprs=("*/5 * * * *" "0 3 * * 1-5" "@daily" "@hourly" "@weekly" "@midnight" "@monthly" "@yearly"
+    "@annually" "@every 1h30m")
   ctrs=()
   logs=()
   i=0
@@ -245,6 +269,23 @@ test_schedule_command_timeout_parsing() {
   done
 }
 
+# README: COMMAND_TIMEOUT is the "Max duration for a scheduled backup", so a
+# one-off backup (no SCHEDULE) runs to the end however long it takes.
+test_schedule_command_timeout_ignored_for_one_off_backup() {
+  db=$(new_db)
+  bucket=$(new_bucket)
+  hooks_setup
+  write_hook pre-backup '#!/bin/sh
+sleep 5
+echo done > /hook-out/slept'
+
+  bk_backup once "$db" "$bucket" -e COMMAND_TIMEOUT=2s "${HOOK_MOUNTS[@]}"
+  assert_rc 0 "one-off backup that outlasts COMMAND_TIMEOUT"
+  assert_file_exists "$CASE_DIR/hook-out/slept" "the pre-backup hook was cut short"
+  assert_log_not_contains "timed out"
+  assert_s3_count "$bucket" backup/ 1 "one-off backups"
+}
+
 test_schedule_command_timeout_stops_long_run() {
   db=$(new_db)
   bucket=$(new_bucket)
@@ -257,12 +298,12 @@ while [ -e /hook-out/slow ]; do sleep 1; done'
 
   bk_start cron -e "POSTGRES_DATABASE=$db" -e "S3_BUCKET=$bucket" -e "SCHEDULE=@every 2s" \
     -e COMMAND_TIMEOUT=8s "${HOOK_MOUNTS[@]}"
-  wait_for 90 _sched_log_has_at_least "Command timed out after 8s" 2 \
+  wait_for 90 _sched_log_has_at_least "timed out after 8s" 2 \
     || fail "slow runs were not timed out"
   assert_log_contains "INFO: Command timeout: 8s"
-  _sched_assert_log_match "$_SCHED_TS ERROR: Command timed out after 8s\$"
+  _sched_assert_log_match "$_SCHED_TS ERROR: .*timed out after 8s"
   # The run must really be stopped after 8s, not merely reported as such.
-  took=$(_sched_log_gap "INFO: Executing command" "Command timed out")
+  took=$(_sched_log_gap "INFO: Executing command" "timed out after 8s")
   [ "$took" -ge 7 ] && [ "$took" -le 13 ] || fail "the first run was stopped after ${took}s, not 8s"
   assert_log_not_contains "Command finished successfully"
   assert_log_not_contains "Creating dump of"
@@ -281,18 +322,18 @@ while [ -e /hook-out/slow ]; do sleep 1; done'
 # running, so a hung pg_dump survives every timeout and the next run starts
 # another one beside it.
 test_schedule_timeout_kills_child_processes() {
-  xfail "COMMAND_TIMEOUT kills only /bin/sh backup.sh; its pg_dump keeps running and timed-out runs pile up"
   db=$(new_db)
   bucket=$(new_bucket)
   _sched_lock_table "$db" app.users
 
   bk_start cron -e "POSTGRES_DATABASE=$db" -e "S3_BUCKET=$bucket" -e "SCHEDULE=@every 2s" \
     -e COMMAND_TIMEOUT=3s
-  wait_for 60 _sched_log_has_at_least "Command timed out after 3s" 2 \
+  wait_for 60 _sched_log_has_at_least "timed out after 3s" 2 \
     || fail "runs blocked on the lock were not timed out"
 
   # At most the current run's pg_dump may be alive; allow a moment for a
   # graceful (SIGTERM, then SIGKILL) implementation to finish the job.
+  xfail "COMMAND_TIMEOUT kills only /bin/sh backup.sh; its pg_dump keeps running and timed-out runs pile up"
   if ! wait_for 10 _sched_live_procs_at_most pg_dump 1; then
     note "processes in $BK_CTR:"
     docker exec "$BK_CTR" ps -o pid,ppid,stat,args | sed 's/^/# /' >&2
@@ -301,6 +342,50 @@ test_schedule_timeout_kills_child_processes() {
     fail "$(_sched_live_procs pg_dump) pg_dump processes alive after two timed-out runs"
   fi
   assert_s3_count "$bucket" "" 0 "runs blocked on the lock must not upload"
+}
+
+# A run stopped by COMMAND_TIMEOUT has failed, so backup.sh's EXIT trap must
+# still remove its dump and fire the backup-error hooks. go-cron sends SIGKILL
+# to /bin/sh backup.sh, so the trap never runs: the dump stays in /tmp and
+# neither the script nor the URL hook hears about the failure.
+test_schedule_timeout_cleans_up_and_reports_error() {
+  db=$(new_db)
+  bucket=$(new_bucket)
+  hooks_setup
+  write_hook backup-error
+  # The first run goes on to pg_dump, which blocks on the lock, so the timeout
+  # hits while a dump file is being written. Later runs wait in this hook
+  # while /hook-out/slow exists, so they time out before writing anything.
+  write_hook pre-backup '#!/bin/sh
+mkdir /hook-out/first 2>/dev/null && exit 0
+while [ -e /hook-out/slow ]; do sleep 1; done'
+  touch "$CASE_DIR/hook-out/slow"
+  _sched_lock_table "$db" app.users
+
+  bk_start cron -e "POSTGRES_DATABASE=$db" -e "S3_BUCKET=$bucket" -e "SCHEDULE=@every 2s" \
+    -e COMMAND_TIMEOUT=8s -e HOOK_ALLOW_HTTP=yes -e "HOOK_BACKUP_ERROR_URL=$(hook_url http ok error)" \
+    "${HOOK_MOUNTS[@]}"
+  wait_for 60 _sched_log_has_at_least "timed out after 8s" 1 || fail "the run blocked in pg_dump was not timed out"
+  assert_log_contains "Creating dump of $db database" "the first run did not reach pg_dump"
+
+  xfail "a run stopped by COMMAND_TIMEOUT is SIGKILLed: no backup-error hooks, and its dump is left in /tmp"
+  # The recording hook writes backup-error.uid last, after its environment.
+  wait_for 20 test -s "$CASE_DIR/hook-out/backup-error.uid" \
+    || fail "backup-error hook did not run after the run in pg_dump timed out (events: $(hook_events))"
+  assert_match "$(grep '^HOOK_EXIT_CODE=' "$CASE_DIR/hook-out/backup-error.env")" '^HOOK_EXIT_CODE=[1-9][0-9]*$' \
+    "backup-error HOOK_EXIT_CODE after a timeout"
+  wait_for 20 _sched_hook_requests_at_least 1 || fail "HOOK_BACKUP_ERROR_URL was not requested after a timeout"
+  assert_eq "$(hook_requests | sort -u)" "http GET /ok/$CASE_SLUG/error" "URL hook requests"
+
+  # A run stopped while waiting in the pre-backup hook reports the same way.
+  wait_for 40 _sched_backup_errors_at_least 2 \
+    || fail "backup-error hook did not run after the run in the pre-backup hook timed out (events: $(hook_events))"
+  _sched_running || fail "container stopped after timed-out runs"
+
+  # Later runs are held in the pre-backup hook, so no run is writing a dump now.
+  left=$(docker exec "$BK_CTR" find /tmp -type f 2>&1)
+  assert_eq "$left" "" "files left in /tmp by timed-out runs"
+  assert_s3_count "$bucket" "" 0 "timed-out runs must not upload"
 }
 
 test_schedule_overlapping_run_is_skipped() {
@@ -346,7 +431,8 @@ test_schedule_failed_run_keeps_scheduling() {
 }
 
 _sched_backup_errors_at_least() {
-  [ "$(grep -c '^backup-error$' "$CASE_DIR/hook-out/events" 2>/dev/null || true)" -ge "$1" ]
+  [ -f "$CASE_DIR/hook-out/events" ] \
+    && [ "$(grep -c '^backup-error$' "$CASE_DIR/hook-out/events" || true)" -ge "$1" ]
 }
 
 test_schedule_docker_stop_is_prompt() {
@@ -401,7 +487,7 @@ echo "$BACKUP_DEST_FILE" >> /hook-out/dest'
 }
 
 _sched_dest_lines_at_least() {
-  [ "$(grep -c . "$CASE_DIR/hook-out/dest" 2>/dev/null || true)" -ge "$1" ]
+  [ -f "$CASE_DIR/hook-out/dest" ] && [ "$(grep -c . "$CASE_DIR/hook-out/dest" || true)" -ge "$1" ]
 }
 
 _sched_hook_requests_at_least() {
@@ -433,7 +519,6 @@ test_schedule_backup_file_restores_once() {
 # progress as one CR-separated line, which passes 64 KiB on uploads of roughly
 # 500 MB; the hook below prints the same kind of line.
 test_schedule_long_output_line_does_not_hang() {
-  xfail "a scheduled run whose output has a line over 64 KiB (aws progress on a ~500 MB upload) hangs for ever"
   db=$(new_db)
   bucket=$(new_bucket)
   hooks_setup
@@ -441,6 +526,7 @@ test_schedule_long_output_line_does_not_hang() {
 awk '\''BEGIN { for (i = 1; i <= 2500; i++) printf "Completed %d.0 KiB/600.0 MiB (150.0 MiB/s) with 1 file(s) remaining\r", i * 256; print "" }'\'''
 
   bk_start cron -e "POSTGRES_DATABASE=$db" -e "S3_BUCKET=$bucket" -e "SCHEDULE=@every 2s" "${HOOK_MOUNTS[@]}"
+  xfail "a scheduled run whose output has a line over 64 KiB (aws progress on a ~500 MB upload) hangs for ever"
   wait_for 30 s3_has_at_least "$bucket" backup/ 1 || { bk_logs; fail "no backup within 30s; the run is stuck"; }
   wait_for 30 _sched_log_has_at_least "Command finished successfully" 1 || fail "run never finished"
 }
@@ -449,7 +535,6 @@ awk '\''BEGIN { for (i = 1; i <= 2500; i++) printf "Completed %d.0 KiB/600.0 MiB
 # pipes; Wait closes them, so the tail of a run's output is dropped and
 # "Error reading output: read |0: file already closed" is logged instead.
 test_schedule_output_is_logged_completely() {
-  xfail "the end of a scheduled run's output is lost (cmd.Wait closes the pipes before they are drained)"
   db=$(new_db)
   bucket=$(new_bucket)
   hooks_setup
@@ -459,6 +544,7 @@ echo end-of-post-backup-output'
 
   bk_start cron -e "POSTGRES_DATABASE=$db" -e "S3_BUCKET=$bucket" -e "SCHEDULE=@every 2s" "${HOOK_MOUNTS[@]}"
   wait_for 90 _sched_log_has_at_least "Command finished successfully" 2 || fail "fewer than 2 runs finished"
+  xfail "the end of a scheduled run's output is lost (cmd.Wait closes the pipes before they are drained)"
   finished=$(grep -Fc "Command finished successfully" "$BK_LOG")
   markers=$(grep -Fc "STDOUT: end-of-post-backup-output" "$BK_LOG" || true)
   [ "$markers" -ge "$finished" ] \
