@@ -144,13 +144,9 @@ hook_url_is_allowed() {
   return 0
 }
 
-hook_run_as_hook() {
-  if [ "${HOOK_DROP_PRIVS:-yes}" = "no" ]; then
-    "$@"
-    return $?
-  fi
-
-  if ! command -v su-exec >/dev/null 2>&1; then
+# Prints the path of su-exec once the hook user and su-exec are known to exist.
+hook_su_exec_path() {
+  if ! _hook_su_exec=$(command -v su-exec 2>/dev/null); then
     echo "ERROR: su-exec is required to run hooks" >&2
     return 1
   fi
@@ -158,7 +154,48 @@ hook_run_as_hook() {
     echo "ERROR: hook user is required to run hooks" >&2
     return 1
   fi
-  su-exec hook "$@"
+  printf '%s' "$_hook_su_exec"
+}
+
+# Runs a command as the hook user with the full environment (HOOK_INHERIT_ENV=yes).
+hook_run_as_hook() {
+  if [ "${HOOK_DROP_PRIVS:-yes}" = "no" ]; then
+    "$@"
+    return $?
+  fi
+
+  _hook_su_exec=$(hook_su_exec_path) || return 1
+  "$_hook_su_exec" hook "$@"
+}
+
+# hook_run_scrubbed NAME=VALUE... -- COMMAND [ARG...] runs the command with
+# only the given environment, as the hook user unless HOOK_DROP_PRIVS=no:
+#   env -i NAME=VALUE... su-exec hook env HOME=/tmp COMMAND [ARG...]
+# env -i runs before su-exec, so no process running as the hook user ever
+# sees the full environment. su-exec sets HOME to the hook user's home
+# directory, which does not exist, so env sets it back to /tmp.
+hook_run_scrubbed() {
+  _hook_su_exec=""
+  if [ "${HOOK_DROP_PRIVS:-yes}" != "no" ]; then
+    _hook_su_exec=$(hook_su_exec_path) || return 1
+  fi
+
+  # Rotate the arguments once, replacing the first -- with su-exec (or nothing).
+  _hook_n=$#
+  _hook_marker=yes
+  while [ "$_hook_n" -gt 0 ]; do
+    if [ "$_hook_marker" = yes ] && [ "$1" = "--" ]; then
+      _hook_marker=no
+      if [ -n "$_hook_su_exec" ]; then
+        set -- "$@" "$_hook_su_exec" hook env HOME=/tmp
+      fi
+    else
+      set -- "$@" "$1"
+    fi
+    shift
+    _hook_n=$((_hook_n - 1))
+  done
+  env -i "$@"
 }
 
 hook_run_script() {
@@ -208,7 +245,7 @@ hook_run_script() {
   fi
 
   # env -i allowlist: never pass passwords, AWS keys, or IRSA/web-identity files.
-  set -- env -i \
+  set -- \
     "PATH=/usr/local/bin:/usr/bin:/bin" \
     "HOME=/tmp" \
     "HOOK_EVENT=${_hook_event}"
@@ -257,8 +294,7 @@ hook_run_script() {
       ;;
   esac
 
-  set -- "$@" "$_hook_script_real" "$_hook_event"
-  hook_run_as_hook "$@"
+  hook_run_scrubbed "$@" -- "$_hook_script_real" "$_hook_event"
 }
 
 hook_run_url() {
@@ -286,7 +322,19 @@ hook_run_url() {
 
   echo "Running URL hook for ${_hook_event}"
 
-  if ! hook_run_as_hook curl -fsS --retry 3 --max-time 30 --proto "$_hook_proto" --max-redirs 0 -- "$_hook_url" >/dev/null 2>/dev/null; then
+  # curl gets only PATH, HOME and the proxy and CA settings, never the
+  # database password or AWS keys. -q (first) ignores any .curlrc in HOME.
+  set -- "PATH=$PATH" "HOME=/tmp"
+  for _hook_var in HTTP_PROXY HTTPS_PROXY NO_PROXY ALL_PROXY \
+    http_proxy https_proxy no_proxy all_proxy \
+    SSL_CERT_FILE SSL_CERT_DIR CURL_CA_BUNDLE; do
+    eval "_hook_val=\${${_hook_var}:-}"
+    if [ -n "$_hook_val" ]; then
+      set -- "$@" "${_hook_var}=${_hook_val}"
+    fi
+  done
+
+  if ! hook_run_scrubbed "$@" -- curl -q -fsS --retry 3 --max-time 30 --proto "$_hook_proto" --max-redirs 0 -- "$_hook_url" >/dev/null 2>/dev/null; then
     echo "ERROR: URL hook for ${_hook_event} failed" >&2
     return 1
   fi

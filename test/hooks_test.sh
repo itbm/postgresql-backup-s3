@@ -231,9 +231,11 @@ assert_ok run_error_hooks restore-error 9
 FAKE_BIN="$WORKDIR/bin"
 mkdir -p "$FAKE_BIN"
 CURL_LOG="$WORKDIR/curl.log"
+CURL_ENV="$WORKDIR/curl.env"
 cat > "$FAKE_BIN/curl" <<EOF
 #! /bin/sh
 printf '%s\n' "\$*" >> "$CURL_LOG"
+env | sort > "$CURL_ENV"
 exit 0
 EOF
 chmod +x "$FAKE_BIN/curl"
@@ -257,6 +259,119 @@ else
   fail "curl argv missing expected flags:"
   cat "$CURL_LOG" >&2
 fi
+# -q must come first for curl to skip .curlrc.
+case "$(tail -n 1 "$CURL_LOG")" in
+  "-q "*) pass ;;
+  *) fail "curl argv does not start with -q: $(tail -n 1 "$CURL_LOG")" ;;
+esac
+
+# curl sees only PATH, HOME and proxy/CA settings, never secrets.
+if grep -E 'supersecret|enc-secret|s3secret|awssecret|session|PGPASSWORD|POSTGRES_PASSWORD|AWS_SECRET_ACCESS_KEY|AWS_ACCESS_KEY_ID|AWS_WEB_IDENTITY|POSTGRES_DATABASE' "$CURL_ENV" >/dev/null; then
+  fail "URL hook curl saw secrets or other variables:"
+  cat "$CURL_ENV" >&2
+else
+  pass
+fi
+assert_eq "$(grep '^HOME=' "$CURL_ENV")" "HOME=/tmp" "URL hook HOME"
+assert_eq "$(grep '^PATH=' "$CURL_ENV")" "PATH=$PATH" "URL hook PATH passed through"
+
+rm -f "$CURL_ENV"
+if (
+  export HTTPS_PROXY=http://proxy.example:3128 no_proxy=.internal SSL_CERT_FILE=/etc/ssl/custom.pem
+  hook_run_url post-backup
+); then
+  pass
+else
+  fail "URL hook with proxy settings failed"
+fi
+if grep -q '^HTTPS_PROXY=http://proxy.example:3128$' "$CURL_ENV" && grep -q '^no_proxy=.internal$' "$CURL_ENV" && grep -q '^SSL_CERT_FILE=/etc/ssl/custom.pem$' "$CURL_ENV"; then
+  pass
+else
+  fail "URL hook did not pass proxy and CA settings:"
+  cat "$CURL_ENV" >&2
+fi
+
+# With privilege dropping, env -i runs before su-exec, so the process that
+# switches to the hook user never sees secrets. The fake su-exec sets HOME as
+# the real one does.
+SU_BIN="$WORKDIR/subin"
+mkdir -p "$SU_BIN"
+cat > "$SU_BIN/su-exec" <<EOF
+#! /bin/sh
+env | sort >> "$WORKDIR/su-exec.env"
+printf '%s\n' "\$1" >> "$WORKDIR/su-exec.user"
+shift
+HOME=/home/hook
+export HOME
+exec "\$@"
+EOF
+printf '#! /bin/sh\nexit 0\n' > "$SU_BIN/id"
+chmod +x "$SU_BIN/su-exec" "$SU_BIN/id"
+
+rm -f "$WORKDIR/su-exec.env" "$WORKDIR/su-exec.user" "$CURL_ENV"
+if (
+  PATH="$SU_BIN:$PATH"
+  HOOK_DROP_PRIVS=yes
+  hook_run_url post-backup
+); then
+  pass
+else
+  fail "URL hook with HOOK_DROP_PRIVS=yes failed"
+fi
+assert_eq "$(cat "$WORKDIR/su-exec.user" 2>/dev/null)" "hook" "URL hook runs as the hook user"
+if [ -f "$WORKDIR/su-exec.env" ] && ! grep -E 'supersecret|awssecret|PGPASSWORD|AWS_SECRET_ACCESS_KEY' "$WORKDIR/su-exec.env" >/dev/null; then
+  pass
+else
+  fail "su-exec for the URL hook saw secrets (env -i must come first):"
+  cat "$WORKDIR/su-exec.env" >&2
+fi
+assert_eq "$(grep '^HOME=' "$CURL_ENV" 2>/dev/null)" "HOME=/tmp" "URL hook HOME after su-exec"
+
+SU_HOOK_ENV="$WORKDIR/su-hook.env"
+printf '#! /bin/sh\nenv | sort > "%s"\n' "$SU_HOOK_ENV" > "$HOOKS_DIR/post-backup"
+chmod +x "$HOOKS_DIR/post-backup"
+rm -f "$WORKDIR/su-exec.env" "$WORKDIR/su-exec.user"
+if (
+  PATH="$SU_BIN:$PATH"
+  HOOK_DROP_PRIVS=yes
+  hook_run_script post-backup
+); then
+  pass
+else
+  fail "script hook with HOOK_DROP_PRIVS=yes failed"
+fi
+assert_eq "$(cat "$WORKDIR/su-exec.user" 2>/dev/null)" "hook" "script hook runs as the hook user"
+if [ -f "$WORKDIR/su-exec.env" ] && ! grep -E 'supersecret|awssecret|PGPASSWORD|AWS_SECRET_ACCESS_KEY' "$WORKDIR/su-exec.env" "$SU_HOOK_ENV" >/dev/null; then
+  pass
+else
+  fail "su-exec or the script hook saw secrets:"
+  cat "$WORKDIR/su-exec.env" "$SU_HOOK_ENV" >&2
+fi
+if grep -q '^HOME=/tmp$' "$SU_HOOK_ENV" && grep -q '^POSTGRES_DATABASE=appdb$' "$SU_HOOK_ENV" && grep -q '^PATH=/usr/local/bin:/usr/bin:/bin$' "$SU_HOOK_ENV"; then
+  pass
+else
+  fail "script hook environment after su-exec:"
+  cat "$SU_HOOK_ENV" >&2
+fi
+
+# HOOK_INHERIT_ENV=yes still passes the full environment through su-exec.
+rm -f "$SU_HOOK_ENV"
+if (
+  PATH="$SU_BIN:$PATH"
+  HOOK_DROP_PRIVS=yes
+  HOOK_INHERIT_ENV=yes
+  hook_run_script post-backup
+); then
+  pass
+else
+  fail "inheriting script hook with HOOK_DROP_PRIVS=yes failed"
+fi
+if grep -q '^POSTGRES_PASSWORD=supersecret$' "$SU_HOOK_ENV"; then
+  pass
+else
+  fail "HOOK_INHERIT_ENV=yes with su-exec should pass POSTGRES_PASSWORD"
+fi
+rm -f "$HOOKS_DIR/post-backup"
 
 # --- backup.sh / restore.sh hook points with fake tools ---
 
