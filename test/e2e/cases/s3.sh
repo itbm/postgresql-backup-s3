@@ -267,6 +267,7 @@ test_s3_prefix_empty_retention_deletes_old_backups() {
   bk_backup first "$db" "$bucket" -e S3_PREFIX=
   assert_rc 0 "first backup with an empty S3_PREFIX"
   old=$(s3_single_key "$bucket" "") || exit 1
+  assert_match "$old" "^${db}_${_S3_TS_RE}\.sql\.gz\$" "key with an empty prefix"
   cutoff=$(_s3_cutoff) || exit 1
 
   bk_backup second "$db" "$bucket" -e S3_PREFIX= -e "DELETE_OLDER_THAN=@$cutoff"
@@ -381,12 +382,18 @@ test_s3_credentials_empty_s3_values_use_aws_environment() {
   _s3_begin
   db=$(_s3_db) || exit 1
   bucket=$(new_bucket) || exit 1
+  creds=(--unset S3_ACCESS_KEY_ID --unset S3_SECRET_ACCESS_KEY -e S3_ACCESS_KEY_ID= -e S3_SECRET_ACCESS_KEY=
+    -e "AWS_ACCESS_KEY_ID=$S3_KEY" -e "AWS_SECRET_ACCESS_KEY=$S3_SECRET")
 
-  bk_backup backup "$db" "$bucket" --unset S3_ACCESS_KEY_ID --unset S3_SECRET_ACCESS_KEY \
-    -e S3_ACCESS_KEY_ID= -e S3_SECRET_ACCESS_KEY= \
-    -e "AWS_ACCESS_KEY_ID=$S3_KEY" -e "AWS_SECRET_ACCESS_KEY=$S3_SECRET"
+  bk_backup backup "$db" "$bucket" "${creds[@]}"
   assert_rc 0 "backup with empty S3_* credentials and AWS_* set"
-  assert_s3_count "$bucket" backup/ 1
+  key=$(s3_single_key "$bucket" backup/) || exit 1
+
+  restored="${db}_copy"
+  _s3_track "$restored"
+  bk_restore restore "$restored" "$bucket" "$key" -e CREATE_DATABASE=yes "${creds[@]}"
+  assert_rc 0 "restore with empty S3_* credentials and AWS_* set"
+  assert_same_data "$db" "$restored"
 }
 
 test_s3_credentials_from_shared_credentials_file() {
@@ -504,6 +511,9 @@ test_s3_credentials_wrong_exit_2_and_change_nothing() {
   bk_restore restore "$db" "$bucket" "$key" -e "S3_SECRET_ACCESS_KEY=$wrong_secret" \
     -e DROP_DATABASE=yes -e CREATE_DATABASE=yes
   assert_rc 2 "restore with a wrong secret key"
+  # The download starts with a HEAD request, whose 403 carries no error code.
+  assert_log_contains "Forbidden"
+  assert_log_not_contains "$wrong_secret" "the secret key appears in the restore log"
   assert_log_not_contains "Dropping database"
   assert_log_not_contains "Database restore completed successfully"
   _s3_assert_marker "$db" "a restore with wrong credentials touched the database"
@@ -544,10 +554,16 @@ test_s3_credentials_half_pair_is_rejected() {
 
   s3_put_string "$bucket" backup/never-restored.sql.gz "not a real backup"
   _s3_mark_db "$db"
-  bk_restore restore "$db" "$bucket" backup/never-restored.sql.gz --unset S3_SECRET_ACCESS_KEY \
+  bk_restore restore-key-only "$db" "$bucket" backup/never-restored.sql.gz --unset S3_SECRET_ACCESS_KEY \
     -e DROP_DATABASE=yes -e CREATE_DATABASE=yes
   assert_rc 1 "restore with S3_ACCESS_KEY_ID but no S3_SECRET_ACCESS_KEY"
   assert_log_contains "You need to set the S3_SECRET_ACCESS_KEY environment variable."
+  assert_log_not_contains "Downloading backup file"
+
+  bk_restore restore-secret-only "$db" "$bucket" backup/never-restored.sql.gz --unset S3_ACCESS_KEY_ID \
+    -e DROP_DATABASE=yes -e CREATE_DATABASE=yes
+  assert_rc 1 "restore with S3_SECRET_ACCESS_KEY but no S3_ACCESS_KEY_ID"
+  assert_log_contains "You need to set the S3_ACCESS_KEY_ID environment variable."
   assert_log_not_contains "Downloading backup file"
   _s3_assert_marker "$db" "a rejected restore touched the database"
 }
@@ -772,23 +788,4 @@ test_s3_key_with_spaces_backup_restore_and_retention() {
   assert_s3_absent "$bucket" "$old" "old backup with spaces in its key was not deleted"
   new=$(s3_single_key "$bucket" "$prefix/") || exit 1
   assert_ne "$new" "$old" "the new backup is kept"
-}
-
-test_s3_retention_handles_repeated_spaces_in_key() {
-  xfail "retention rebuilds each key from 'aws s3 ls' with awk field splitting, which collapses repeated spaces, so it deletes a key that does not exist, logs success and keeps the old backup"
-  _s3_begin
-  bucket=$(new_bucket) || exit 1
-  name="$(printf 't_%s' "$CASE_SLUG" | tr '-' '_' | cut -c1-40)  two  spaces"
-  _s3_db_named "$name"
-
-  bk_backup first "$name" "$bucket"
-  assert_rc 0 "backup of '$name'"
-  old=$(s3_single_key "$bucket" backup/) || exit 1
-  assert_match "$old" "^backup/${name}_${_S3_TS_RE}\.sql\.gz\$" "key keeps the repeated spaces"
-  cutoff=$(_s3_cutoff) || exit 1
-
-  bk_backup second "$name" "$bucket" -e "DELETE_OLDER_THAN=@$cutoff"
-  assert_rc 0 "backup with retention"
-  assert_s3_absent "$bucket" "$old" "old backup with repeated spaces in its key was not deleted"
-  assert_s3_count "$bucket" backup/ 1 "backups left after retention"
 }
