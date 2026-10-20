@@ -17,9 +17,17 @@ _urls_backup_opts() {
 
 _urls_restore_opts() {
   _URLS_OPTS=(-v "$(e2e_ca_system_mount)"
-    -e "HOOK_PRE_RESTORE_URL=$(hook_url https ok pre-restore)"
-    -e "HOOK_POST_RESTORE_URL=$(hook_url https ok post-restore)"
-    -e "HOOK_RESTORE_ERROR_URL=$(hook_url https ok restore-error)")
+    -e "HOOK_PRE_RESTORE_URL=$(hook_url https "${1:-ok}" pre-restore)"
+    -e "HOOK_POST_RESTORE_URL=$(hook_url https "${2:-ok}" post-restore)"
+    -e "HOOK_RESTORE_ERROR_URL=$(hook_url https "${3:-ok}" restore-error)")
+}
+
+# _urls_backup_key <db> <bucket> - takes a plain backup without hooks and
+# prints its key.
+_urls_backup_key() {
+  bk_backup backup "$1" "$2"
+  assert_rc 0 "backup for the restore test"
+  s3_single_key "$2" backup/
 }
 
 # _urls_assert_refused <url> <reason> [suffix] - a pre-backup URL is refused
@@ -79,7 +87,7 @@ test_hookurls_restore_failure_pings_pre_then_error() {
   assert_eq "$(_urls_seen | tr '\n' ',')" "https GET ok/pre-restore,https GET ok/restore-error," "requests"
 }
 
-test_hookurls_validation_errors_send_no_requests() {
+test_hookurls_validation_error_sends_no_requests() {
   db=$(new_db)
   _urls_backup_opts
   bk_run backup --unset S3_ACCESS_KEY_ID -e "POSTGRES_DATABASE=$db" -e "S3_BUCKET=$CASE_SLUG" \
@@ -214,4 +222,68 @@ test_hookurls_failing_error_url_keeps_exit_code() {
   assert_rc 2 "exit code of the failed upload"
   assert_log_contains "backup-error hook failed; keeping original exit code 2"
   assert_eq "$(_urls_seen | tr '\n' ',')" "https GET ok/pre-backup,https GET fail/backup-error," "requests"
+}
+
+test_hookurls_pre_restore_403_leaves_database_untouched() {
+  db=$(new_db)
+  bucket=$(new_bucket)
+  key=$(_urls_backup_key "$db" "$bucket") || fail "no backup"
+  target=$(new_db target)
+  psql_exec "$target" "CREATE TABLE urls_marker (i integer)" || fail "could not create marker"
+  _urls_restore_opts fail
+  bk_restore restore "$target" "$bucket" "$key" -e DROP_DATABASE=yes -e CREATE_DATABASE=yes \
+    "${_URLS_OPTS[@]}"
+  assert_rc_nonzero "pre-restore URL answered 403"
+  assert_log_contains "ERROR: URL hook for pre-restore failed"
+  assert_log_not_contains "Downloading backup file"
+  assert_log_not_contains "Dropping database"
+  assert_eq "$(psql_exec "$target" "SELECT to_regclass('urls_marker') IS NOT NULL")" t \
+    "database must be untouched"
+  assert_eq "$(_urls_seen | tr '\n' ',')" "https GET fail/pre-restore,https GET ok/restore-error," "requests"
+}
+
+test_hookurls_post_restore_403_fails_job() {
+  db=$(new_db)
+  bucket=$(new_bucket)
+  key=$(_urls_backup_key "$db" "$bucket") || fail "no backup"
+  _urls_restore_opts ok fail
+  bk_restore restore "${db}_r" "$bucket" "$key" -e CREATE_DATABASE=yes "${_URLS_OPTS[@]}"
+  assert_rc_nonzero "post-restore URL answered 403"
+  assert_log_contains "ERROR: URL hook for post-restore failed"
+  # The data was restored before the hook ran; the job still reports failure.
+  assert_same_data "$db" "${db}_r"
+  assert_eq "$(_urls_seen | tr '\n' ',')" \
+    "https GET ok/pre-restore,https GET fail/post-restore,https GET ok/restore-error," "requests"
+}
+
+test_hookurls_failing_restore_error_url_keeps_exit_code() {
+  db=$(new_db)
+  bucket=$(new_bucket)
+  _urls_restore_opts ok ok fail
+  bk_restore restore "$db" "$bucket" backup/missing.sql.gz "${_URLS_OPTS[@]}"
+  assert_rc 2 "exit code of the failed download"
+  assert_log_contains "restore-error hook failed; keeping original exit code 2"
+  assert_eq "$(_urls_seen | tr '\n' ',')" "https GET ok/pre-restore,https GET fail/restore-error," "requests"
+}
+
+# README: URL hooks are GET requests with no body and no secret headers.
+test_hookurls_requests_carry_no_secrets() {
+  db=$(new_db)
+  bucket=$(new_bucket)
+  _urls_backup_opts
+  bk_backup backup "$db" "$bucket" -e ENCRYPTION_PASSWORD=urls-enc-secret-5c1e "${_URLS_OPTS[@]}"
+  assert_rc 0
+  headers=$(hook_request_headers)
+  assert_eq "$(printf '%s\n' "$headers" | grep -c .)" 2 "logged requests"
+  for secret in "$PG_PASSWORD" "$S3_SECRET" "$S3_KEY" urls-enc-secret-5c1e; do
+    case "$headers" in
+      *"$secret"*) fail "a hook request carried a secret: $headers" ;;
+    esac
+  done
+  for name in Authorization Cookie Content-Length Content-Type; do
+    case "$headers" in
+      *"\"$name\""*) fail "unexpected $name header: $headers" ;;
+    esac
+  done
+  assert_eq "$(_urls_seen | awk '{print $2}' | sort -u)" GET "request methods"
 }
