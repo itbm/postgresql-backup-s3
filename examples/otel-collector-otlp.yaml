@@ -39,8 +39,11 @@ exporters:
   # Your backend. Add authentication headers if it needs them, for example:
   #   headers:
   #     authorization: Bearer ${env:OTLP_BACKEND_TOKEN}
-  # For Prometheus 3 with --web.enable-otlp-receiver, the base URL is
-  # http://<prometheus>:9090/api/v1/otlp.
+  # Prometheus 3 with --web.enable-otlp-receiver accepts metrics only, so do
+  # not point this exporter at it. Instead, add an exporter such as this one,
+  # and use it in place of otlp_http in the metrics pipeline only:
+  #   otlp_http/prometheus:
+  #     metrics_endpoint: http://<prometheus>:9090/api/v1/otlp/v1/metrics
   otlp_http:
     endpoint: ${env:OTLP_BACKEND_ENDPOINT:-https://otlp.example.com}
   # Prints a summary of what arrives to the Collector's own log. Use

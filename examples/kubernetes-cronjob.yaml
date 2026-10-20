@@ -2,7 +2,7 @@
 # backup of one database, and a weekly restore drill that proves the backups
 # can be restored.
 #
-# Create the Secret first, for example:
+# Create the Secrets first, for example:
 #
 #   kubectl -n backup create secret generic pgbackup-appdb \
 #     --from-literal=postgres-user=... \
@@ -12,6 +12,13 @@
 #     --from-literal=encryption-password=... \
 #     --from-literal=heartbeat-backup-url=https://hc-ping.com/<uuid> \
 #     --from-literal=heartbeat-restore-url=https://hc-ping.com/<other uuid>
+#
+# The restore drill logs in to its scratch database server with its own
+# credentials:
+#
+#   kubectl -n backup create secret generic pgbackup-scratch \
+#     --from-literal=postgres-user=... \
+#     --from-literal=postgres-password=...
 #
 # OTEL_EXPORTER_OTLP_ENDPOINT points at an OpenTelemetry Collector, such as
 # otel-collector-otlp.yaml. Without it, the -otel image behaves like the

@@ -39,7 +39,7 @@ services:
       MINIO_ROOT_USER: minioadmin
       MINIO_ROOT_PASSWORD: minioadmin-password
     ports:
-      - "9001:9001" # MinIO console
+      - "127.0.0.1:9001:9001" # MinIO console
 
   # Creates the bucket once MinIO answers, then exits.
   create-bucket:
@@ -58,8 +58,8 @@ services:
   lgtm:
     image: grafana/otel-lgtm:0.37.0
     ports:
-      - "3000:3000" # Grafana
-      - "4318:4318" # OTLP/HTTP
+      - "127.0.0.1:3000:3000" # Grafana
+      - "127.0.0.1:4318:4318" # OTLP/HTTP
 
   backup:
     build:

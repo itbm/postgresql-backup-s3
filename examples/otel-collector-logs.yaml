@@ -13,6 +13,10 @@
 # with the node's /var/log/pods mounted read-only. For Docker, see the comments
 # in the file_log receiver.
 #
+# Every line the Collector reads is trusted: any container whose logs it reads
+# can print a pgbackup-result line and create or overwrite these metrics, for
+# example to hide a failed backup. Read only the backup containers' logs.
+#
 # Counters and histograms: signal_to_metrics produces them as deltas, one per
 # result line, and the delta_to_cumulative processor adds them up into running
 # totals for Prometheus. The totals start again from zero when the Collector
@@ -22,13 +26,14 @@
 
 receivers:
   file_log:
-    # Kubernetes: every container on the node. To read only the backup pods,
-    # narrow it, for example to /var/log/pods/<namespace>_<cronjob>-*/*/*.log.
-    include: [/var/log/pods/*/*/*.log]
-    # Docker with the default json-file log driver: use this include instead,
-    # mount /var/lib/docker/containers read-only, and set
-    # add_metadata_from_filepath to false below.
-    # include: [/var/lib/docker/containers/*/*-json.log]
+    # Kubernetes: the pods in namespace "backup" whose names start with
+    # "pgbackup-", as in kubernetes-cronjob.yaml. The pattern is
+    # /var/log/pods/<namespace>_<pod name>_<pod UID>/<container>/<n>.log.
+    include: [/var/log/pods/backup_pgbackup-*/*/*.log]
+    # Docker with the default json-file log driver: use an include such as
+    # this one for the backup container only, mount /var/lib/docker/containers
+    # read-only, and set add_metadata_from_filepath to false below.
+    # include: [/var/lib/docker/containers/<container ID>/<container ID>-json.log]
     include_file_path: true
     # Files that exist when the Collector starts are read from the end. Files
     # that appear later, such as a new CronJob pod's, are read from the start.

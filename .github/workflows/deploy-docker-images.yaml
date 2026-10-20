@@ -86,6 +86,8 @@ jobs:
           username: ${{ secrets.DOCKER_USERNAME }}
           password: ${{ secrets.DOCKER_PASSWORD }}
           repository: itbm/postgresql-backup-s3
+          # Docker Hub does not resolve relative links, so make them absolute.
+          enable-url-completion: true
 
       - name: Update repo description
         if: matrix.variant == 'default'
@@ -94,3 +96,5 @@ jobs:
           username: ${{ secrets.DOCKER_USERNAME }}
           password: ${{ secrets.DOCKER_PASSWORD }}
           repository: itbm/postgres-backup-s3
+          # Docker Hub does not resolve relative links, so make them absolute.
+          enable-url-completion: true
