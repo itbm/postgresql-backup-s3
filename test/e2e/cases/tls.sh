@@ -6,33 +6,8 @@ _TLS_SYS_DIR=/usr/local/share/ca-certificates
 _TLS_TS_RE='[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z'
 
 # ---------------------------------------------------------------------------
-# Helpers.
-
-# _tls_begin - call first in every test (after xfail). Databases recorded with
-# _tls_db or _tls_track are dropped when the case ends, so a full run does not
-# keep growing the server's data volume. E2E_KEEP=1 keeps them.
-_tls_begin() {
-  : >"$CASE_DIR/tls-dbs"
-  [ "${E2E_KEEP:-0}" = 1 ] || trap _tls_end EXIT
-}
-
-_tls_end() {
-  # fd 3, because psql_exec (docker exec -i) would swallow the rest of stdin.
-  while IFS= read -r _te_db <&3; do
-    [ -z "$_te_db" ] || drop_db "$_te_db" </dev/null >/dev/null 2>&1
-  done 3<"$CASE_DIR/tls-dbs"
-}
-
-_tls_track() {
-  printf '%s\n' "$@" >>"$CASE_DIR/tls-dbs"
-}
-
-# _tls_db [suffix] - new_db, recorded for dropping. Use as db=$(_tls_db) || exit 1.
-_tls_db() {
-  _td_name=$(new_db "$@") || exit 1
-  _tls_track "$_td_name"
-  printf '%s\n' "$_td_name"
-}
+# Helpers. Restores go to <new_db name>_restored, which run.sh drops with the
+# case's other databases.
 
 # Buckets on minio-tls, inspected through mc (which trusts the e2e CA).
 _tls_bucket() {
@@ -90,7 +65,7 @@ _tls_assert_rejected() {
 _tls_roundtrip() {
   _rt_what=$1
   shift
-  _rt_db=$(_tls_db) || exit 1
+  _rt_db=$(new_db) || exit 1
   _rt_bucket=$(_tls_bucket) || exit 1
 
   _tls_backup backup "$_rt_db" "$_rt_bucket" "$@"
@@ -98,7 +73,6 @@ _tls_roundtrip() {
   _rt_key=$(_tls_backup_key "$_rt_db" "$_rt_bucket") || exit 1
 
   _rt_restored="${_rt_db}_restored"
-  _tls_track "$_rt_restored"
   _tls_restore restore "$_rt_restored" "$_rt_bucket" "$_rt_key" -e CREATE_DATABASE=yes "$@"
   assert_rc 0 "restore with $_rt_what"
   assert_log_contains "Database restore completed successfully"
@@ -176,7 +150,7 @@ _tls_assert_system_bundle_has() {
 _tls_scheduled() {
   _ts_what=$1
   shift
-  _ts_db=$(_tls_db) || exit 1
+  _ts_db=$(new_db) || exit 1
   _ts_bucket=$(_tls_bucket) || exit 1
 
   bk_start cron -e "POSTGRES_DATABASE=$_ts_db" -e "S3_BUCKET=$_ts_bucket" --unset S3_ENDPOINT \
@@ -196,8 +170,7 @@ _tls_scheduled() {
 # Verification is on by default.
 
 test_tls_no_ca_backup_rejected() {
-  _tls_begin
-  db=$(_tls_db) || exit 1
+  db=$(new_db) || exit 1
   bucket=$(_tls_bucket) || exit 1
 
   _tls_backup backup "$db" "$bucket"
@@ -205,9 +178,9 @@ test_tls_no_ca_backup_rejected() {
   assert_eq "$(bk_tmp_leftovers)" "" "temporary files left in /tmp after the rejected upload"
 }
 
-test_tls_ssl_verify_yes_rejects_unknown_ca() {
-  _tls_begin
-  db=$(_tls_db) || exit 1
+# yes is the documented default; setting it explicitly must not loosen anything.
+test_tls_explicit_ssl_verify_yes_keeps_verification() {
+  db=$(new_db) || exit 1
   bucket=$(_tls_bucket) || exit 1
 
   _tls_backup backup "$db" "$bucket" -e S3_SSL_VERIFY=yes
@@ -215,12 +188,10 @@ test_tls_ssl_verify_yes_rejects_unknown_ca() {
 }
 
 test_tls_no_ca_restore_rejected_before_touching_database() {
-  _tls_begin
-  db=$(_tls_db) || exit 1
+  db=$(new_db) || exit 1
   bucket=$(_tls_bucket) || exit 1
   key=$(_tls_seed_backup "$db" "$bucket") || exit 1
   restored="${db}_restored"
-  _tls_track "$restored"
 
   _tls_restore restore "$restored" "$bucket" "$key" -e CREATE_DATABASE=yes
   assert_rc 2 "restore over TLS with no CA configured"
@@ -245,13 +216,11 @@ test_tls_no_ca_restore_rejected_before_touching_database() {
 # Trusting the minio-tls CA.
 
 test_tls_ca_bundle_backup_and_restore() {
-  _tls_begin
   _tls_roundtrip "S3_CA_BUNDLE" -e S3_CA_BUNDLE=/certs/ca.crt -v "$E2E_CERTS/ca.crt:/certs/ca.crt:ro"
 }
 
 test_tls_ca_bundle_accepts_multi_cert_bundle_at_path_with_space() {
-  _tls_begin
-  db=$(_tls_db) || exit 1
+  db=$(new_db) || exit 1
   bucket=$(_tls_bucket) || exit 1
   # The right CA comes second, so only reading the first certificate would fail.
   cat "$E2E_CERTS/other-ca.crt" "$E2E_CERTS/ca.crt" >"$CASE_DIR/bundle.pem"
@@ -264,19 +233,36 @@ test_tls_ca_bundle_accepts_multi_cert_bundle_at_path_with_space() {
 }
 
 test_tls_ca_bundle_scheduled_backups() {
-  _tls_begin
   _tls_scheduled "scheduled backups with S3_CA_BUNDLE" \
     -e S3_CA_BUNDLE=/certs/ca.crt -v "$E2E_CERTS/ca.crt:/certs/ca.crt:ro"
 }
 
+# Retention lists and deletes over TLS as well, so those calls need the CA too.
+test_tls_ca_bundle_retention_deletes_old_and_keeps_new_backup() {
+  db=$(new_db) || exit 1
+  bucket=$(_tls_bucket) || exit 1
+  S3_ALIAS=tls s3_put_string "$bucket" backup/old.sql.gz "an old backup"
+  cutoff=$(_tls_cutoff) || exit 1
+  S3_ALIAS=tls s3_put_string "$bucket" backup/recent.sql.gz "a backup newer than the cutoff"
+
+  _tls_backup backup "$db" "$bucket" -e "DELETE_OLDER_THAN=@$cutoff" \
+    -e S3_CA_BUNDLE=/certs/ca.crt -v "$E2E_CERTS/ca.crt:/certs/ca.crt:ro"
+  _tls_assert_backup_ok "backup with S3_CA_BUNDLE and DELETE_OLDER_THAN"
+  # urllib3 warns about every request it sends without checking the certificate.
+  assert_log_not_contains "InsecureRequestWarning" "a request to minio-tls skipped certificate verification"
+  S3_ALIAS=tls assert_s3_absent "$bucket" backup/old.sql.gz "retention with S3_CA_BUNDLE did not delete the old backup"
+  S3_ALIAS=tls assert_s3_exists "$bucket" backup/recent.sql.gz "retention deleted a backup newer than the cutoff"
+  S3_ALIAS=tls assert_s3_count "$bucket" backup/ 2 "objects left after retention"
+  new=$(S3_ALIAS=tls s3_keys "$bucket" "backup/${db}_")
+  assert_match "$new" "^backup/${db}_${_TLS_TS_RE}\.sql\.gz\$" "the backup this run uploaded"
+}
+
 test_tls_system_ca_dir_backup_and_restore() {
-  _tls_begin
   _tls_roundtrip "the CA mounted in $_TLS_SYS_DIR" -v "$(e2e_ca_system_mount)"
 }
 
 test_tls_system_ca_dir_adds_every_crt_file_to_system_roots() {
-  _tls_begin
-  db=$(_tls_db) || exit 1
+  db=$(new_db) || exit 1
   bucket=$(_tls_bucket) || exit 1
   _tls_make_ca unrelated-2
 
@@ -292,8 +278,7 @@ test_tls_system_ca_dir_adds_every_crt_file_to_system_roots() {
 }
 
 test_tls_system_ca_dir_ignores_file_without_crt_suffix() {
-  _tls_begin
-  db=$(_tls_db) || exit 1
+  db=$(new_db) || exit 1
   bucket=$(_tls_bucket) || exit 1
 
   _tls_backup backup "$db" "$bucket" -v "$E2E_CERTS/ca.crt:$_TLS_SYS_DIR/e2e-ca.pem:ro"
@@ -301,12 +286,10 @@ test_tls_system_ca_dir_ignores_file_without_crt_suffix() {
 }
 
 test_tls_system_ca_dir_scheduled_backups() {
-  _tls_begin
   _tls_scheduled "scheduled backups with the CA mounted in $_TLS_SYS_DIR" -v "$(e2e_ca_system_mount)"
 }
 
 test_tls_aws_ca_bundle_backup_and_restore() {
-  _tls_begin
   _tls_roundtrip "AWS_CA_BUNDLE" -e AWS_CA_BUNDLE=/certs/ca.crt -v "$E2E_CERTS/ca.crt:/certs/ca.crt:ro"
 }
 
@@ -314,8 +297,7 @@ test_tls_aws_ca_bundle_backup_and_restore() {
 # Precedence: S3_CA_BUNDLE, then a pre-set AWS_CA_BUNDLE, then the system path.
 
 test_tls_ca_bundle_overrides_system_ca_dir() {
-  _tls_begin
-  db=$(_tls_db) || exit 1
+  db=$(new_db) || exit 1
   bucket=$(_tls_bucket) || exit 1
 
   _tls_backup backup "$db" "$bucket" -v "$E2E_CERTS/other-ca.crt:$_TLS_SYS_DIR/other-ca.crt:ro" \
@@ -325,8 +307,7 @@ test_tls_ca_bundle_overrides_system_ca_dir() {
 }
 
 test_tls_ca_bundle_overrides_aws_ca_bundle() {
-  _tls_begin
-  db=$(_tls_db) || exit 1
+  db=$(new_db) || exit 1
   bucket=$(_tls_bucket) || exit 1
 
   _tls_backup backup "$db" "$bucket" -e AWS_CA_BUNDLE=/certs/other-ca.crt \
@@ -337,8 +318,7 @@ test_tls_ca_bundle_overrides_aws_ca_bundle() {
 }
 
 test_tls_aws_ca_bundle_wins_over_system_ca_dir() {
-  _tls_begin
-  db=$(_tls_db) || exit 1
+  db=$(new_db) || exit 1
   bucket=$(_tls_bucket) || exit 1
 
   _tls_backup backup "$db" "$bucket" -v "$(e2e_ca_system_mount)" \
@@ -350,8 +330,7 @@ test_tls_aws_ca_bundle_wins_over_system_ca_dir() {
 # Misconfigured trust fails closed.
 
 test_tls_ca_bundle_wrong_ca_rejected() {
-  _tls_begin
-  db=$(_tls_db) || exit 1
+  db=$(new_db) || exit 1
   bucket=$(_tls_bucket) || exit 1
 
   _tls_backup backup "$db" "$bucket" -e S3_CA_BUNDLE=/certs/other-ca.crt \
@@ -360,8 +339,7 @@ test_tls_ca_bundle_wrong_ca_rejected() {
 }
 
 test_tls_ca_bundle_missing_file_fails_closed() {
-  _tls_begin
-  db=$(_tls_db) || exit 1
+  db=$(new_db) || exit 1
   bucket=$(_tls_bucket) || exit 1
 
   # The system directory would work; a broken S3_CA_BUNDLE must not fall back to it.
@@ -372,8 +350,7 @@ test_tls_ca_bundle_missing_file_fails_closed() {
 }
 
 test_tls_hostname_mismatch_rejected_with_trusted_ca() {
-  _tls_begin
-  db=$(_tls_db) || exit 1
+  db=$(new_db) || exit 1
   bucket=$(_tls_bucket) || exit 1
 
   # Same server, reached by its container name, which the certificate does not list.
@@ -388,8 +365,7 @@ test_tls_hostname_mismatch_rejected_with_trusted_ca() {
 # S3_SSL_VERIFY=no.
 
 test_tls_ssl_verify_no_backup_retention_and_restore() {
-  _tls_begin
-  db=$(_tls_db) || exit 1
+  db=$(new_db) || exit 1
   bucket=$(_tls_bucket) || exit 1
   S3_ALIAS=tls s3_put_string "$bucket" backup/old.sql.gz "an old backup"
   cutoff=$(_tls_cutoff) || exit 1
@@ -401,7 +377,6 @@ test_tls_ssl_verify_no_backup_retention_and_restore() {
   key=$(_tls_backup_key "$db" "$bucket") || exit 1
 
   restored="${db}_restored"
-  _tls_track "$restored"
   _tls_restore restore "$restored" "$bucket" "$key" -e CREATE_DATABASE=yes -e S3_SSL_VERIFY=no
   assert_rc 0 "restore with S3_SSL_VERIFY=no and no CA"
   assert_log_contains "Database restore completed successfully"
@@ -409,8 +384,7 @@ test_tls_ssl_verify_no_backup_retention_and_restore() {
 }
 
 test_tls_ssl_verify_no_ignores_wrong_ca_bundle() {
-  _tls_begin
-  db=$(_tls_db) || exit 1
+  db=$(new_db) || exit 1
   bucket=$(_tls_bucket) || exit 1
 
   _tls_backup backup "$db" "$bucket" -e S3_SSL_VERIFY=no -e S3_CA_BUNDLE=/certs/other-ca.crt \
