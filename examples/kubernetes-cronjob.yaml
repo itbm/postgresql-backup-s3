@@ -1,0 +1,250 @@
+# Kubernetes CronJobs for postgresql-backup-s3 with the -otel image: a nightly
+# backup of one database, and a weekly restore drill that proves the backups
+# can be restored.
+#
+# Create the Secret first, for example:
+#
+#   kubectl -n backup create secret generic pgbackup-appdb \
+#     --from-literal=postgres-user=... \
+#     --from-literal=postgres-password=... \
+#     --from-literal=s3-access-key-id=... \
+#     --from-literal=s3-secret-access-key=... \
+#     --from-literal=encryption-password=... \
+#     --from-literal=heartbeat-backup-url=https://hc-ping.com/<uuid> \
+#     --from-literal=heartbeat-restore-url=https://hc-ping.com/<other uuid>
+#
+# OTEL_EXPORTER_OTLP_ENDPOINT points at an OpenTelemetry Collector, such as
+# otel-collector-otlp.yaml. Without it, the -otel image behaves like the
+# default image.
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: pgbackup-appdb
+  namespace: backup
+spec:
+  schedule: "0 2 * * *"
+  timeZone: Etc/UTC
+  # Never start a backup while the previous one is still running.
+  concurrencyPolicy: Forbid
+  # Skip a run that could not start within an hour of its time.
+  startingDeadlineSeconds: 3600
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      # Retry a failed backup once. Each attempt is a separate run, with its
+      # own result line, trace and metrics.
+      backoffLimit: 1
+      # Stop a backup that takes longer than 4 hours. Kubernetes sends SIGTERM,
+      # so the backup-error hook runs and the run's telemetry is sent.
+      activeDeadlineSeconds: 14400
+      template:
+        metadata:
+          labels:
+            app.kubernetes.io/name: postgresql-backup-s3
+            app.kubernetes.io/instance: appdb
+        spec:
+          restartPolicy: Never
+          # Time for an interrupted backup to clean up, and then for go-cron to
+          # send its telemetry, before Kubernetes sends SIGKILL. The run's
+          # telemetry is sent only if the script exits within this period
+          # minus TELEMETRY_SHUTDOWN_TIMEOUT (5s by default).
+          terminationGracePeriodSeconds: 45
+          containers:
+            - name: backup
+              # Pin a release in production, for example <version>-otel.
+              image: itbm/postgresql-backup-s3:latest-otel
+              env:
+                - name: POSTGRES_DATABASE
+                  value: appdb
+                - name: POSTGRES_HOST
+                  value: postgres.database.svc.cluster.local
+                - name: POSTGRES_USER
+                  valueFrom:
+                    secretKeyRef:
+                      name: pgbackup-appdb
+                      key: postgres-user
+                - name: POSTGRES_PASSWORD
+                  valueFrom:
+                    secretKeyRef:
+                      name: pgbackup-appdb
+                      key: postgres-password
+                - name: S3_BUCKET
+                  value: my-backups
+                - name: S3_PREFIX
+                  value: appdb
+                - name: S3_REGION
+                  value: eu-west-2
+                - name: S3_ACCESS_KEY_ID
+                  valueFrom:
+                    secretKeyRef:
+                      name: pgbackup-appdb
+                      key: s3-access-key-id
+                - name: S3_SECRET_ACCESS_KEY
+                  valueFrom:
+                    secretKeyRef:
+                      name: pgbackup-appdb
+                      key: s3-secret-access-key
+                - name: ENCRYPTION_PASSWORD
+                  valueFrom:
+                    secretKeyRef:
+                      name: pgbackup-appdb
+                      key: encryption-password
+                - name: DELETE_OLDER_THAN
+                  value: 30 days ago
+                - name: DELETE_MATCH_DATABASE
+                  value: "yes"
+                # A heartbeat check that alerts when no successful backup
+                # arrives, even if nothing else reports.
+                - name: HOOK_POST_BACKUP_URL
+                  valueFrom:
+                    secretKeyRef:
+                      name: pgbackup-appdb
+                      key: heartbeat-backup-url
+                - name: OTEL_EXPORTER_OTLP_ENDPOINT
+                  value: http://otel-collector.monitoring.svc.cluster.local:4318
+                # Describe the pod, without making it part of the series
+                # identity: service.instance.id stays the default, which is
+                # derived from the database and bucket, so every run of this
+                # CronJob reports to the same series.
+                - name: K8S_POD_NAME
+                  valueFrom:
+                    fieldRef:
+                      fieldPath: metadata.name
+                - name: K8S_NAMESPACE_NAME
+                  valueFrom:
+                    fieldRef:
+                      fieldPath: metadata.namespace
+                - name: K8S_NODE_NAME
+                  valueFrom:
+                    fieldRef:
+                      fieldPath: spec.nodeName
+                - name: OTEL_RESOURCE_ATTRIBUTES
+                  value: k8s.pod.name=$(K8S_POD_NAME),k8s.namespace.name=$(K8S_NAMESPACE_NAME),k8s.node.name=$(K8S_NODE_NAME)
+              resources:
+                requests:
+                  cpu: 100m
+                  memory: 256Mi
+                limits:
+                  memory: 1Gi
+              volumeMounts:
+                - name: tmp
+                  mountPath: /tmp
+          volumes:
+            # The dump is written to /tmp before it is uploaded, so give it
+            # room for the largest backup.
+            - name: tmp
+              emptyDir:
+                sizeLimit: 20Gi
+---
+# Weekly restore drill: restores the newest backup of appdb into a scratch
+# database server and pings a separate heartbeat URL when it succeeds.
+#
+# DROP_DATABASE=yes drops the database on POSTGRES_HOST before the restore.
+# Point POSTGRES_HOST at a scratch server, never at production.
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: pgbackup-appdb-restore-drill
+  namespace: backup
+spec:
+  # Sundays at 06:00, after that night's backup.
+  schedule: "0 6 * * 0"
+  timeZone: Etc/UTC
+  concurrencyPolicy: Forbid
+  startingDeadlineSeconds: 3600
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      backoffLimit: 0
+      activeDeadlineSeconds: 14400
+      template:
+        metadata:
+          labels:
+            app.kubernetes.io/name: postgresql-backup-s3
+            app.kubernetes.io/instance: appdb-restore-drill
+        spec:
+          restartPolicy: Never
+          terminationGracePeriodSeconds: 45
+          containers:
+            - name: restore
+              image: itbm/postgresql-backup-s3:latest-otel
+              env:
+                # BACKUP_FILE makes the container restore instead of back up.
+                # latest picks the newest backup of POSTGRES_DATABASE.
+                - name: BACKUP_FILE
+                  value: latest
+                - name: POSTGRES_DATABASE
+                  value: appdb
+                - name: POSTGRES_HOST
+                  value: postgres-scratch.backup.svc.cluster.local
+                - name: POSTGRES_USER
+                  valueFrom:
+                    secretKeyRef:
+                      name: pgbackup-scratch
+                      key: postgres-user
+                - name: POSTGRES_PASSWORD
+                  valueFrom:
+                    secretKeyRef:
+                      name: pgbackup-scratch
+                      key: postgres-password
+                - name: DROP_DATABASE
+                  value: "yes"
+                - name: CREATE_DATABASE
+                  value: "yes"
+                - name: S3_BUCKET
+                  value: my-backups
+                - name: S3_PREFIX
+                  value: appdb
+                - name: S3_REGION
+                  value: eu-west-2
+                - name: S3_ACCESS_KEY_ID
+                  valueFrom:
+                    secretKeyRef:
+                      name: pgbackup-appdb
+                      key: s3-access-key-id
+                - name: S3_SECRET_ACCESS_KEY
+                  valueFrom:
+                    secretKeyRef:
+                      name: pgbackup-appdb
+                      key: s3-secret-access-key
+                - name: ENCRYPTION_PASSWORD
+                  valueFrom:
+                    secretKeyRef:
+                      name: pgbackup-appdb
+                      key: encryption-password
+                - name: HOOK_POST_RESTORE_URL
+                  valueFrom:
+                    secretKeyRef:
+                      name: pgbackup-appdb
+                      key: heartbeat-restore-url
+                - name: OTEL_EXPORTER_OTLP_ENDPOINT
+                  value: http://otel-collector.monitoring.svc.cluster.local:4318
+                - name: K8S_POD_NAME
+                  valueFrom:
+                    fieldRef:
+                      fieldPath: metadata.name
+                - name: K8S_NAMESPACE_NAME
+                  valueFrom:
+                    fieldRef:
+                      fieldPath: metadata.namespace
+                - name: K8S_NODE_NAME
+                  valueFrom:
+                    fieldRef:
+                      fieldPath: spec.nodeName
+                - name: OTEL_RESOURCE_ATTRIBUTES
+                  value: k8s.pod.name=$(K8S_POD_NAME),k8s.namespace.name=$(K8S_NAMESPACE_NAME),k8s.node.name=$(K8S_NODE_NAME)
+              resources:
+                requests:
+                  cpu: 100m
+                  memory: 256Mi
+                limits:
+                  memory: 1Gi
+              volumeMounts:
+                - name: tmp
+                  mountPath: /tmp
+          volumes:
+            - name: tmp
+              emptyDir:
+                sizeLimit: 20Gi

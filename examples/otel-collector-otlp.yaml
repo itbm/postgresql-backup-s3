@@ -1,0 +1,69 @@
+# OpenTelemetry Collector for the -otel image. It receives traces, metrics and,
+# with OTEL_LOGS_EXPORTER=otlp, logs over OTLP/HTTP, and forwards them to your
+# backend. Point the backup container at it with:
+#
+#   OTEL_EXPORTER_OTLP_ENDPOINT=http://<collector host>:4318
+#
+# Set OTLP_BACKEND_ENDPOINT in the Collector's environment to your backend's
+# OTLP/HTTP base URL; the exporter adds /v1/traces, /v1/metrics and /v1/logs.
+#
+# Tested with otelcol-contrib 0.162.0. Older Collector releases know the
+# components only as otlphttp and deltatocumulative.
+
+receivers:
+  otlp:
+    protocols:
+      # go-cron sends OTLP/HTTP (http/protobuf) only, so no gRPC receiver.
+      http:
+        endpoint: 0.0.0.0:4318
+
+processors:
+  memory_limiter:
+    check_interval: 1s
+    limit_percentage: 80
+    spike_limit_percentage: 25
+  batch: {}
+  # One-shot runs (a Kubernetes CronJob, or no SCHEDULE) start their counters
+  # and histograms from zero every time. To keep running totals instead, set
+  # OTEL_EXPORTER_OTLP_METRICS_TEMPORALITY_PREFERENCE=delta in the backup
+  # container, uncomment this processor and add it to the metrics pipeline.
+  # max_stale must be longer than the schedule period, and every run of a
+  # target must have the same resource attributes, so remove per-pod ones such
+  # as k8s.pod.name from the metrics first. The totals start again from zero
+  # when the Collector restarts. Never send delta metrics straight to
+  # Prometheus.
+  # delta_to_cumulative:
+  #   max_stale: 26h
+
+exporters:
+  # Your backend. Add authentication headers if it needs them, for example:
+  #   headers:
+  #     authorization: Bearer ${env:OTLP_BACKEND_TOKEN}
+  # For Prometheus 3 with --web.enable-otlp-receiver, the base URL is
+  # http://<prometheus>:9090/api/v1/otlp.
+  otlp_http:
+    endpoint: ${env:OTLP_BACKEND_ENDPOINT:-https://otlp.example.com}
+  # Prints a summary of what arrives to the Collector's own log. Use
+  # verbosity: detailed to see every span, data point and log record.
+  debug:
+    verbosity: basic
+  # Or let Prometheus scrape the Collector instead of pushing to a backend.
+  # Add it to the metrics pipeline and set honor_labels: true in the scrape
+  # configuration, so that the job and instance labels are kept.
+  # prometheus:
+  #   endpoint: 0.0.0.0:9464
+
+service:
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors: [memory_limiter, batch]
+      exporters: [otlp_http, debug]
+    metrics:
+      receivers: [otlp]
+      processors: [memory_limiter, batch]
+      exporters: [otlp_http, debug]
+    logs:
+      receivers: [otlp]
+      processors: [memory_limiter, batch]
+      exporters: [otlp_http, debug]

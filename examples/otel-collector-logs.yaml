@@ -1,0 +1,188 @@
+# OpenTelemetry Collector recipe: metrics from the pgbackup-result line.
+#
+# backup.sh and restore.sh print one pgbackup-result line at the end of every
+# run, in both images. This recipe reads it from the container logs and turns
+# it into metrics, so the backup container needs no change. The metrics have
+# the same names and attributes as the -otel image's, so
+# prometheus-alerts.yaml works with either.
+#
+# Tested with otelcol-contrib 0.162.0. Older Collector releases know the
+# components only as filelog, signaltometrics and deltatocumulative.
+#
+# As written, it reads Kubernetes pod logs: run the Collector as a DaemonSet
+# with the node's /var/log/pods mounted read-only. For Docker, see the comments
+# in the file_log receiver.
+#
+# Counters and histograms: signal_to_metrics produces them as deltas, one per
+# result line, and the delta_to_cumulative processor adds them up into running
+# totals for Prometheus. The totals start again from zero when the Collector
+# restarts, and they are kept per Collector, so on Kubernetes each node has its
+# own. The gauges (last success, last failure, size and retention) do not
+# depend on this.
+
+receivers:
+  file_log:
+    # Kubernetes: every container on the node. To read only the backup pods,
+    # narrow it, for example to /var/log/pods/<namespace>_<cronjob>-*/*/*.log.
+    include: [/var/log/pods/*/*/*.log]
+    # Docker with the default json-file log driver: use this include instead,
+    # mount /var/lib/docker/containers read-only, and set
+    # add_metadata_from_filepath to false below.
+    # include: [/var/lib/docker/containers/*/*-json.log]
+    include_file_path: true
+    # Files that exist when the Collector starts are read from the end. Files
+    # that appear later, such as a new CronJob pod's, are read from the start.
+    start_at: end
+    operators:
+      # Parses the Docker, containerd and CRI-O log formats. On Kubernetes it
+      # also adds k8s.namespace.name, k8s.pod.name and other attributes from
+      # the file path.
+      - type: container
+        add_metadata_from_filepath: true
+      # Drops every line except result lines. In scheduled mode go-cron puts
+      # "[<time>] STDERR: " in front of them.
+      - type: filter
+        expr: 'not (body matches "^(\\[[^]]*\\] STDERR: )?pgbackup-result ")'
+      # Keeps each log file's lines apart until the transform processor has
+      # identified the backup target.
+      - type: move
+        from: attributes["log.file.path"]
+        to: resource["log.file.path"]
+      # Values that contain a space, a double quote, an equals sign, a
+      # backslash or a control character are double-quoted, with \ and "
+      # escaped. They go to the *_quoted attributes, and the transform
+      # processor removes the quoting.
+      - type: regex_parser
+        regex: '^(?:\[[^\]]*\] STDERR: )?pgbackup-result operation=(?P<operation>[a-z]+) outcome=(?P<outcome>[a-z]+) exit_code=(?P<exit_code>[0-9]+) database=(?:"(?P<database_quoted>(?:[^"\\]|\\.)*)"|(?P<database>[^ ]*)) duration_s=(?P<duration_s>[0-9.]+)(?: [a-z0-9_]+_s=[0-9.]+)*(?: failed_phase=(?P<failed_phase>[a-z0-9-]+))?(?: size_bytes=(?P<size_bytes>[0-9]+))?(?: retention_deleted=(?P<retention_deleted>[0-9]+))?(?: retention_kept=(?P<retention_kept>[0-9]+))?(?: file=(?:"(?P<file_quoted>(?:[^"\\]|\\.)*)"|(?P<file>[^ ]*)))?'
+
+processors:
+  transform/pgbackup:
+    error_mode: ignore
+    log_statements:
+      - context: log
+        statements:
+          # Remove the quoting from database and file.
+          - set(attributes["database"], attributes["database_quoted"]) where attributes["database_quoted"] != nil and attributes["database_quoted"] != ""
+          - replace_pattern(attributes["database"], "\\\\(.)", "$$1") where attributes["database_quoted"] != nil and attributes["database_quoted"] != ""
+          - set(attributes["file"], attributes["file_quoted"]) where attributes["file_quoted"] != nil and attributes["file_quoted"] != ""
+          - replace_pattern(attributes["file"], "\\\\(.)", "$$1") where attributes["file_quoted"] != nil and attributes["file_quoted"] != ""
+          - delete_matching_keys(attributes, "_quoted$")
+          # Remove the optional fields that were not on the line.
+          - delete_key(attributes, "failed_phase") where attributes["failed_phase"] == ""
+          - delete_key(attributes, "size_bytes") where attributes["size_bytes"] == ""
+          - delete_key(attributes, "retention_deleted") where attributes["retention_deleted"] == ""
+          - delete_key(attributes, "retention_kept") where attributes["retention_kept"] == ""
+          - delete_key(attributes, "file") where attributes["file"] == ""
+          # The -otel image's attribute names. As there, db.namespace is left
+          # out for POSTGRES_DATABASE=all.
+          - set(attributes["pgbackup.operation"], attributes["operation"])
+          - set(attributes["pgbackup.outcome"], attributes["outcome"])
+          - set(attributes["db.namespace"], attributes["database"]) where attributes["database"] != "all"
+          # The backup target's identity, which becomes the Prometheus job and
+          # instance labels. The instance is the database name, after the
+          # Kubernetes namespace when there is one. If two targets share these,
+          # change this statement, for example to use part of k8s.pod.name.
+          - set(resource.attributes["service.name"], "postgresql-backup-s3")
+          - set(resource.attributes["service.instance.id"], attributes["database"])
+          - set(resource.attributes["service.instance.id"], Concat([resource.attributes["k8s.namespace.name"], attributes["database"]], "/")) where resource.attributes["k8s.namespace.name"] != nil
+          # Drop per-pod and per-file attributes, so that every run of a
+          # target adds to the same totals.
+          - keep_keys(resource.attributes, ["service.name", "service.instance.id", "k8s.namespace.name"])
+
+  delta_to_cumulative:
+    # Must be longer than the schedule period: here, a day plus 2 hours.
+    max_stale: 26h
+
+connectors:
+  signal_to_metrics:
+    logs:
+      - name: pgbackup.runs
+        description: Finished runs.
+        unit: "{run}"
+        conditions: ['attributes["pgbackup.outcome"] != nil']
+        attributes:
+          - key: pgbackup.operation
+          - key: pgbackup.outcome
+          - key: db.namespace
+            optional: true
+        sum:
+          value: Int(1)
+          monotonic: true
+      - name: pgbackup.last_success.timestamp
+        description: Unix time at which the last successful run finished.
+        unit: s
+        conditions: ['attributes["pgbackup.outcome"] == "success"']
+        attributes:
+          - key: pgbackup.operation
+          - key: db.namespace
+            optional: true
+        gauge:
+          value: Double(UnixSeconds(time))
+      - name: pgbackup.last_failure.timestamp
+        description: Unix time at which the last failed or cancelled run finished.
+        unit: s
+        conditions: ['attributes["pgbackup.outcome"] != nil and attributes["pgbackup.outcome"] != "success"']
+        attributes:
+          - key: pgbackup.operation
+          - key: db.namespace
+            optional: true
+        gauge:
+          value: Double(UnixSeconds(time))
+      - name: pgbackup.backup.size
+        description: Size of the last uploaded backup.
+        unit: By
+        conditions: ['attributes["size_bytes"] != nil']
+        attributes:
+          - key: db.namespace
+            optional: true
+        gauge:
+          value: Int(attributes["size_bytes"])
+      - name: pgbackup.retention.deleted
+        description: Backups deleted by the last retention pass.
+        unit: "{object}"
+        conditions: ['attributes["retention_deleted"] != nil']
+        attributes:
+          - key: db.namespace
+            optional: true
+        gauge:
+          value: Int(attributes["retention_deleted"])
+      - name: pgbackup.retention.kept
+        description: Backups kept by the last retention pass.
+        unit: "{object}"
+        conditions: ['attributes["retention_kept"] != nil']
+        attributes:
+          - key: db.namespace
+            optional: true
+        gauge:
+          value: Int(attributes["retention_kept"])
+      - name: pgbackup.run.duration
+        description: Duration of runs.
+        unit: s
+        conditions: ['attributes["duration_s"] != nil']
+        attributes:
+          - key: pgbackup.operation
+          - key: pgbackup.outcome
+          - key: db.namespace
+            optional: true
+        histogram:
+          buckets: [0.1, 0.5, 1, 5, 10, 30, 60, 120, 300, 600, 1200, 1800, 3600, 7200, 14400, 28800, 86400]
+          value: Double(attributes["duration_s"])
+
+exporters:
+  # Prometheus scrapes this endpoint. Set honor_labels: true in its scrape
+  # configuration, so that it keeps the job and instance labels set above.
+  # A series is exported for 5 minutes after each run (metric_expiration), and
+  # prometheus-alerts.yaml is written for metrics that come and go like this.
+  prometheus:
+    endpoint: 0.0.0.0:9464
+
+service:
+  pipelines:
+    logs:
+      receivers: [file_log]
+      processors: [transform/pgbackup]
+      exporters: [signal_to_metrics]
+    metrics:
+      receivers: [signal_to_metrics]
+      processors: [delta_to_cumulative]
+      exporters: [prometheus]

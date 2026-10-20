@@ -1,0 +1,96 @@
+# A local trial of the -otel image: PostgreSQL, a MinIO server for the backups,
+# and grafana/otel-lgtm, which runs an OpenTelemetry Collector with Grafana,
+# Prometheus, Tempo and Loki in one container. Not for production: the
+# passwords are fixed and nothing is persisted.
+#
+# From the repository root:
+#
+#   docker compose -f examples/docker-compose.otel.yaml up --build
+#
+# The backup container builds the image with GOCRON_VARIANT=otel, takes a
+# backup at once and then every 5 minutes. Open Grafana at
+# http://localhost:3000 (user admin, password admin) and look for the
+# pgbackup_* metrics, the backup traces of service postgresql-backup-s3, and
+# its logs.
+#
+# MinIO no longer publishes its own container images, so this uses
+# Chainguard's MinIO builds.
+
+name: pgbackup-otel
+
+services:
+  postgres:
+    image: postgres:18-alpine
+    environment:
+      POSTGRES_DB: appdb
+      POSTGRES_USER: app
+      POSTGRES_PASSWORD: app-password
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U app -d appdb"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+
+  minio:
+    image: cgr.dev/chainguard/minio:latest
+    # The image runs as a non-root user, so keep the data in /tmp.
+    command: ["server", "/tmp/minio-data", "--console-address", ":9001"]
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin-password
+    ports:
+      - "9001:9001" # MinIO console
+
+  # Creates the bucket once MinIO answers, then exits.
+  create-bucket:
+    image: cgr.dev/chainguard/minio-client:latest-dev
+    depends_on:
+      - minio
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        until mc alias set local http://minio:9000 minioadmin minioadmin-password; do
+          sleep 1
+        done
+        mc mb --ignore-existing local/backups
+    restart: "no"
+
+  lgtm:
+    image: grafana/otel-lgtm:0.37.0
+    ports:
+      - "3000:3000" # Grafana
+      - "4318:4318" # OTLP/HTTP
+
+  backup:
+    build:
+      context: ..
+      args:
+        GOCRON_VARIANT: otel
+    depends_on:
+      postgres:
+        condition: service_healthy
+      create-bucket:
+        condition: service_completed_successfully
+      lgtm:
+        condition: service_started
+    environment:
+      POSTGRES_DATABASE: appdb
+      POSTGRES_HOST: postgres
+      POSTGRES_USER: app
+      POSTGRES_PASSWORD: app-password
+      S3_ACCESS_KEY_ID: minioadmin
+      S3_SECRET_ACCESS_KEY: minioadmin-password
+      S3_BUCKET: backups
+      S3_ENDPOINT: http://minio:9000
+      S3_S3V4: "yes"
+      SCHEDULE: "@every 5m"
+      BACKUP_ON_START: "yes"
+      # Keeps the last 30 minutes of backups, so the retention phase and its
+      # metrics appear too.
+      DELETE_OLDER_THAN: 30 minutes ago
+      DELETE_MATCH_DATABASE: "yes"
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://lgtm:4318
+      # Log export is off unless you ask for it.
+      OTEL_LOGS_EXPORTER: otlp
+      # Export metrics every 10 seconds instead of every minute, for the demo.
+      OTEL_METRIC_EXPORT_INTERVAL: "10000"

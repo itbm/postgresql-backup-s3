@@ -1,0 +1,84 @@
+# Prometheus alert rules for postgresql-backup-s3. They work with the metrics
+# of the -otel image and with the metrics that otel-collector-logs.yaml makes
+# from the pgbackup-result line.
+#
+# A backup target is identified by the job and instance labels, which come from
+# the service.name and service.instance.id resource attributes. Every rule
+# aggregates by these labels, so per-pod or per-version labels never split one
+# target into several series. Give each target a stable service.instance.id;
+# the -otel image does this by default.
+#
+# The windows assume a daily schedule:
+#   26h  the schedule period plus 2 hours' grace.
+#   8d   how long a target that has stopped reporting is still known. After 8
+#        days without any data its alerts resolve, so also monitor the job
+#        itself, for example with a heartbeat hook or kube-state-metrics.
+# For another schedule, set 26h to the period plus some grace and keep 8d
+# several times longer than the period.
+#
+# Metrics from short-lived runs, such as a Kubernetes CronJob, exist only for a
+# few minutes after each run, so every rule reads them with max_over_time or
+# last_over_time instead of using the latest sample.
+#
+# Test the rules with:
+#   promtool test rules prometheus-alerts.test.yaml
+groups:
+- name: pgbackup
+  rules:
+  # No successful backup within the window, or none at all for a target that
+  # has reported runs.
+  - alert: PgBackupNoRecentSuccess
+    expr: |
+      (
+        time() - max by (job, instance, pgbackup_operation) (
+          max_over_time(pgbackup_last_success_timestamp_seconds{pgbackup_operation="backup"}[8d])
+        ) > 26 * 3600
+      )
+      or
+      (
+        group by (job, instance, pgbackup_operation) (max_over_time(pgbackup_runs_total{pgbackup_operation="backup"}[8d]))
+        unless on (job, instance, pgbackup_operation)
+        group by (job, instance, pgbackup_operation) (max_over_time(pgbackup_last_success_timestamp_seconds{pgbackup_operation="backup"}[8d]))
+      )
+    labels:
+      severity: critical
+    annotations:
+      summary: No successful backup of {{ $labels.job }}/{{ $labels.instance }} in 26 hours
+      description: '{{ $labels.job }}/{{ $labels.instance }} has not reported a successful backup in the last 26 hours. Check the logs of the latest runs and their pgbackup-result lines.'
+  # The latest run failed and nothing has succeeded since.
+  - alert: PgBackupLastRunFailed
+    expr: |
+      max by (job, instance, pgbackup_operation) (max_over_time(pgbackup_last_failure_timestamp_seconds{pgbackup_operation="backup"}[26h]))
+      >
+      (
+        max by (job, instance, pgbackup_operation) (max_over_time(pgbackup_last_success_timestamp_seconds{pgbackup_operation="backup"}[8d]))
+        or
+        0 * max by (job, instance, pgbackup_operation) (max_over_time(pgbackup_last_failure_timestamp_seconds{pgbackup_operation="backup"}[26h]))
+      )
+    labels:
+      severity: warning
+    annotations:
+      summary: Last backup of {{ $labels.job }}/{{ $labels.instance }} failed
+      description: The latest backup of {{ $labels.job }}/{{ $labels.instance }} failed and no backup has succeeded since. Check the failed run's logs or trace.
+  # The target reported runs earlier but none within the window.
+  - alert: PgBackupNotReporting
+    expr: |
+      group by (job, instance, pgbackup_operation) (max_over_time(pgbackup_runs_total{pgbackup_operation="backup"}[8d]))
+      unless on (job, instance, pgbackup_operation)
+      group by (job, instance, pgbackup_operation) (max_over_time(pgbackup_runs_total{pgbackup_operation="backup"}[26h]))
+    labels:
+      severity: warning
+    annotations:
+      summary: No backup runs from {{ $labels.job }}/{{ $labels.instance }} in 26 hours
+      description: '{{ $labels.job }}/{{ $labels.instance }} reported backup runs in the last 8 days but none in the last 26 hours. The job may be suspended or deleted, or its metrics may not reach Prometheus.'
+  # The latest backup is less than half the size of the largest one in the two
+  # days before it.
+  - alert: PgBackupSizeDrop
+    expr: |
+      max by (job, instance) (last_over_time(pgbackup_backup_size_bytes[26h]))
+      < 0.5 * max by (job, instance) (max_over_time(pgbackup_backup_size_bytes[2d] offset 26h))
+    labels:
+      severity: warning
+    annotations:
+      summary: Backup of {{ $labels.job }}/{{ $labels.instance }} shrank by more than half
+      description: The latest backup of {{ $labels.job }}/{{ $labels.instance }} is less than half the size of the largest backup in the 2 days before it. Check that the database and the dump are complete.

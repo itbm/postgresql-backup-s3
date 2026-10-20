@@ -1,0 +1,783 @@
+# Unit tests for prometheus-alerts.yaml. Run them with:
+#   promtool test rules prometheus-alerts.test.yaml
+#
+# Each instance is one backup target with a daily backup at 02:00 (minute 120,
+# then every 1440 minutes). Instance names describe the scenario:
+#   oneshot-*  one run per process, such as a Kubernetes CronJob: each run
+#              leaves a single sample, and nothing in between.
+#   sched-*    a long-lived container with SCHEDULE: samples continue
+#              between runs.
+#   *-ok       every backup succeeds.
+#   *-pods     every run comes from a new pod, with a k8s_pod_name label.
+#   *-upgrade  the image is upgraded, which changes otel_scope_version.
+#   *-never    no backup has ever succeeded.
+#   *-failing  backups succeed once, then fail every day.
+#   *-drop     the backup size falls from 1 GB to 300 MB on day 4.
+#   *-stopped  the target stops reporting after day 2.
+# oneshot-ok also reports a restore, which must not affect backup alerts.
+rule_files:
+  - prometheus-alerts.yaml
+
+evaluation_interval: 1m
+
+tests:
+  - interval: 1m
+    input_series:
+      - series: 'pgbackup_last_success_timestamp_seconds{job="pgbackup",instance="oneshot-ok",pgbackup_operation="backup"}'
+        values: '_x119 _ 7200 _x1438 _ 93600 _x1438 _ 180000 _x1438 _ 266400 _x1438 _ 352800 _x1438 _ 439200 _x78 _'
+      - series: 'pgbackup_runs_total{job="pgbackup",instance="oneshot-ok",pgbackup_operation="backup",pgbackup_outcome="success"}'
+        values: '_x119 _ 1 _x1438 _ 1 _x1438 _ 1 _x1438 _ 1 _x1438 _ 1 _x1438 _ 1 _x78 _'
+      - series: 'pgbackup_backup_size_bytes{job="pgbackup",instance="oneshot-ok"}'
+        values: '_x119 _ 1000000000 _x1438 _ 1000000000 _x1438 _ 1000000000 _x1438 _ 1000000000 _x1438 _ 1000000000 _x1438 _ 1000000000 _x78 _'
+      - series: 'pgbackup_last_success_timestamp_seconds{job="pgbackup",instance="oneshot-pods",pgbackup_operation="backup",k8s_pod_name="pod-0"}'
+        values: '_x119 _ 7200 _x7278 _'
+      - series: 'pgbackup_runs_total{job="pgbackup",instance="oneshot-pods",pgbackup_operation="backup",pgbackup_outcome="success",k8s_pod_name="pod-0"}'
+        values: '_x119 _ 1 _x7278 _'
+      - series: 'pgbackup_backup_size_bytes{job="pgbackup",instance="oneshot-pods",k8s_pod_name="pod-0"}'
+        values: '_x119 _ 1000000000 _x7278 _'
+      - series: 'pgbackup_last_success_timestamp_seconds{job="pgbackup",instance="oneshot-pods",pgbackup_operation="backup",k8s_pod_name="pod-1"}'
+        values: '_x1559 _ 93600 _x5838 _'
+      - series: 'pgbackup_runs_total{job="pgbackup",instance="oneshot-pods",pgbackup_operation="backup",pgbackup_outcome="success",k8s_pod_name="pod-1"}'
+        values: '_x1559 _ 1 _x5838 _'
+      - series: 'pgbackup_backup_size_bytes{job="pgbackup",instance="oneshot-pods",k8s_pod_name="pod-1"}'
+        values: '_x1559 _ 1000000000 _x5838 _'
+      - series: 'pgbackup_last_success_timestamp_seconds{job="pgbackup",instance="oneshot-pods",pgbackup_operation="backup",k8s_pod_name="pod-2"}'
+        values: '_x2999 _ 180000 _x4398 _'
+      - series: 'pgbackup_runs_total{job="pgbackup",instance="oneshot-pods",pgbackup_operation="backup",pgbackup_outcome="success",k8s_pod_name="pod-2"}'
+        values: '_x2999 _ 1 _x4398 _'
+      - series: 'pgbackup_backup_size_bytes{job="pgbackup",instance="oneshot-pods",k8s_pod_name="pod-2"}'
+        values: '_x2999 _ 1000000000 _x4398 _'
+      - series: 'pgbackup_last_success_timestamp_seconds{job="pgbackup",instance="oneshot-pods",pgbackup_operation="backup",k8s_pod_name="pod-3"}'
+        values: '_x4439 _ 266400 _x2958 _'
+      - series: 'pgbackup_runs_total{job="pgbackup",instance="oneshot-pods",pgbackup_operation="backup",pgbackup_outcome="success",k8s_pod_name="pod-3"}'
+        values: '_x4439 _ 1 _x2958 _'
+      - series: 'pgbackup_backup_size_bytes{job="pgbackup",instance="oneshot-pods",k8s_pod_name="pod-3"}'
+        values: '_x4439 _ 1000000000 _x2958 _'
+      - series: 'pgbackup_last_success_timestamp_seconds{job="pgbackup",instance="oneshot-pods",pgbackup_operation="backup",k8s_pod_name="pod-4"}'
+        values: '_x5879 _ 352800 _x1518 _'
+      - series: 'pgbackup_runs_total{job="pgbackup",instance="oneshot-pods",pgbackup_operation="backup",pgbackup_outcome="success",k8s_pod_name="pod-4"}'
+        values: '_x5879 _ 1 _x1518 _'
+      - series: 'pgbackup_backup_size_bytes{job="pgbackup",instance="oneshot-pods",k8s_pod_name="pod-4"}'
+        values: '_x5879 _ 1000000000 _x1518 _'
+      - series: 'pgbackup_last_success_timestamp_seconds{job="pgbackup",instance="oneshot-pods",pgbackup_operation="backup",k8s_pod_name="pod-5"}'
+        values: '_x7319 _ 439200 _x78 _'
+      - series: 'pgbackup_runs_total{job="pgbackup",instance="oneshot-pods",pgbackup_operation="backup",pgbackup_outcome="success",k8s_pod_name="pod-5"}'
+        values: '_x7319 _ 1 _x78 _'
+      - series: 'pgbackup_backup_size_bytes{job="pgbackup",instance="oneshot-pods",k8s_pod_name="pod-5"}'
+        values: '_x7319 _ 1000000000 _x78 _'
+      - series: 'pgbackup_last_success_timestamp_seconds{job="pgbackup",instance="sched-ok",pgbackup_operation="backup"}'
+        values: '_x119 _ 7200+0x1439 93600+0x1439 180000+0x1439 266400+0x1439 352800+0x1439 439200+0x79'
+      - series: 'pgbackup_runs_total{job="pgbackup",instance="sched-ok",pgbackup_operation="backup",pgbackup_outcome="success"}'
+        values: '_x119 _ 1+0x1439 2+0x1439 3+0x1439 4+0x1439 5+0x1439 6+0x79'
+      - series: 'pgbackup_backup_size_bytes{job="pgbackup",instance="sched-ok"}'
+        values: '_x119 _ 1000000000+0x7279'
+      - series: 'pgbackup_last_success_timestamp_seconds{job="pgbackup",instance="sched-upgrade",pgbackup_operation="backup",otel_scope_version="1.0"}'
+        values: '_x119 _ 7200+0x1439 93600+0x439 _x5399 _'
+      - series: 'pgbackup_last_success_timestamp_seconds{job="pgbackup",instance="sched-upgrade",pgbackup_operation="backup",otel_scope_version="1.1"}'
+        values: '_x2999 _ 180000+0x1439 266400+0x1439 352800+0x1439 439200+0x79'
+      - series: 'pgbackup_runs_total{job="pgbackup",instance="sched-upgrade",pgbackup_operation="backup",pgbackup_outcome="success",otel_scope_version="1.0"}'
+        values: '_x119 _ 1+0x1439 2+0x439 _x5399 _'
+      - series: 'pgbackup_runs_total{job="pgbackup",instance="sched-upgrade",pgbackup_operation="backup",pgbackup_outcome="success",otel_scope_version="1.1"}'
+        values: '_x2999 _ 1+0x1439 2+0x1439 3+0x1439 4+0x79'
+      - series: 'pgbackup_backup_size_bytes{job="pgbackup",instance="sched-upgrade",otel_scope_version="1.0"}'
+        values: '_x119 _ 1000000000+0x1879 _x5399 _'
+      - series: 'pgbackup_backup_size_bytes{job="pgbackup",instance="sched-upgrade",otel_scope_version="1.1"}'
+        values: '_x2999 _ 1000000000+0x4399'
+      - series: 'pgbackup_last_failure_timestamp_seconds{job="pgbackup",instance="oneshot-never",pgbackup_operation="backup"}'
+        values: '_x119 _ 7200 _x1438 _ 93600 _x1438 _ 180000 _x1438 _ 266400 _x1438 _ 352800 _x1438 _ 439200 _x78 _'
+      - series: 'pgbackup_runs_total{job="pgbackup",instance="oneshot-never",pgbackup_operation="backup",pgbackup_outcome="failure"}'
+        values: '_x119 _ 1 _x1438 _ 1 _x1438 _ 1 _x1438 _ 1 _x1438 _ 1 _x1438 _ 1 _x78 _'
+      - series: 'pgbackup_last_failure_timestamp_seconds{job="pgbackup",instance="sched-never",pgbackup_operation="backup"}'
+        values: '_x119 _ 7200+0x1439 93600+0x1439 180000+0x1439 266400+0x1439 352800+0x1439 439200+0x79'
+      - series: 'pgbackup_runs_total{job="pgbackup",instance="sched-never",pgbackup_operation="backup",pgbackup_outcome="failure"}'
+        values: '_x119 _ 1+0x1439 2+0x1439 3+0x1439 4+0x1439 5+0x1439 6+0x79'
+      - series: 'pgbackup_last_success_timestamp_seconds{job="pgbackup",instance="oneshot-failing",pgbackup_operation="backup"}'
+        values: '_x119 _ 7200 _x7278 _'
+      - series: 'pgbackup_runs_total{job="pgbackup",instance="oneshot-failing",pgbackup_operation="backup",pgbackup_outcome="success"}'
+        values: '_x119 _ 1 _x7278 _'
+      - series: 'pgbackup_last_failure_timestamp_seconds{job="pgbackup",instance="oneshot-failing",pgbackup_operation="backup"}'
+        values: '_x1559 _ 93600 _x1438 _ 180000 _x1438 _ 266400 _x1438 _ 352800 _x1438 _ 439200 _x78 _'
+      - series: 'pgbackup_runs_total{job="pgbackup",instance="oneshot-failing",pgbackup_operation="backup",pgbackup_outcome="failure"}'
+        values: '_x1559 _ 1 _x1438 _ 1 _x1438 _ 1 _x1438 _ 1 _x1438 _ 1 _x78 _'
+      - series: 'pgbackup_backup_size_bytes{job="pgbackup",instance="oneshot-failing"}'
+        values: '_x119 _ 1000000000 _x7278 _'
+      - series: 'pgbackup_last_success_timestamp_seconds{job="pgbackup",instance="sched-failing",pgbackup_operation="backup"}'
+        values: '_x119 _ 7200+0x7279'
+      - series: 'pgbackup_runs_total{job="pgbackup",instance="sched-failing",pgbackup_operation="backup",pgbackup_outcome="success"}'
+        values: '_x119 _ 1+0x7279'
+      - series: 'pgbackup_last_failure_timestamp_seconds{job="pgbackup",instance="sched-failing",pgbackup_operation="backup"}'
+        values: '_x1559 _ 93600+0x1439 180000+0x1439 266400+0x1439 352800+0x1439 439200+0x79'
+      - series: 'pgbackup_runs_total{job="pgbackup",instance="sched-failing",pgbackup_operation="backup",pgbackup_outcome="failure"}'
+        values: '_x1559 _ 1+0x1439 2+0x1439 3+0x1439 4+0x1439 5+0x79'
+      - series: 'pgbackup_backup_size_bytes{job="pgbackup",instance="sched-failing"}'
+        values: '_x119 _ 1000000000+0x7279'
+      - series: 'pgbackup_backup_size_bytes{job="pgbackup",instance="oneshot-drop"}'
+        values: '_x119 _ 1000000000 _x1438 _ 1000000000 _x1438 _ 1000000000 _x1438 _ 300000000 _x1438 _ 300000000 _x1438 _ 300000000 _x78 _'
+      - series: 'pgbackup_last_success_timestamp_seconds{job="pgbackup",instance="oneshot-drop",pgbackup_operation="backup"}'
+        values: '_x119 _ 7200 _x1438 _ 93600 _x1438 _ 180000 _x1438 _ 266400 _x1438 _ 352800 _x1438 _ 439200 _x78 _'
+      - series: 'pgbackup_runs_total{job="pgbackup",instance="oneshot-drop",pgbackup_operation="backup",pgbackup_outcome="success"}'
+        values: '_x119 _ 1 _x1438 _ 1 _x1438 _ 1 _x1438 _ 1 _x1438 _ 1 _x1438 _ 1 _x78 _'
+      - series: 'pgbackup_backup_size_bytes{job="pgbackup",instance="sched-drop"}'
+        values: '_x119 _ 1000000000+0x4319 300000000+0x2959'
+      - series: 'pgbackup_last_success_timestamp_seconds{job="pgbackup",instance="sched-drop",pgbackup_operation="backup"}'
+        values: '_x119 _ 7200+0x1439 93600+0x1439 180000+0x1439 266400+0x1439 352800+0x1439 439200+0x79'
+      - series: 'pgbackup_runs_total{job="pgbackup",instance="sched-drop",pgbackup_operation="backup",pgbackup_outcome="success"}'
+        values: '_x119 _ 1+0x1439 2+0x1439 3+0x1439 4+0x1439 5+0x1439 6+0x79'
+      - series: 'pgbackup_last_success_timestamp_seconds{job="pgbackup",instance="oneshot-stopped",pgbackup_operation="backup"}'
+        values: '_x120 7200 _x1439 93600 _x5839'
+      - series: 'pgbackup_runs_total{job="pgbackup",instance="oneshot-stopped",pgbackup_operation="backup",pgbackup_outcome="success"}'
+        values: '_x120 1 _x1439 1 _x5839'
+      - series: 'pgbackup_last_success_timestamp_seconds{job="pgbackup",instance="sched-stopped",pgbackup_operation="backup"}'
+        values: '_x120 7200+0x1439 93600+0x439 _x5400'
+      - series: 'pgbackup_runs_total{job="pgbackup",instance="sched-stopped",pgbackup_operation="backup",pgbackup_outcome="success"}'
+        values: '_x120 1+0x1439 2+0x439 _x5400'
+      - series: 'pgbackup_last_success_timestamp_seconds{job="pgbackup",instance="oneshot-ok",pgbackup_operation="restore"}'
+        values: '_x200 12000 _x7199'
+      - series: 'pgbackup_runs_total{job="pgbackup",instance="oneshot-ok",pgbackup_operation="restore",pgbackup_outcome="success"}'
+        values: '_x200 1 _x7199'
+
+    alert_rule_test:
+      - eval_time: 60m
+        alertname: PgBackupNoRecentSuccess
+        exp_alerts: []
+      - eval_time: 60m
+        alertname: PgBackupLastRunFailed
+        exp_alerts: []
+      - eval_time: 60m
+        alertname: PgBackupNotReporting
+        exp_alerts: []
+      - eval_time: 60m
+        alertname: PgBackupSizeDrop
+        exp_alerts: []
+      - eval_time: 1500m
+        alertname: PgBackupNoRecentSuccess
+        exp_alerts:
+          - exp_labels:
+              job: pgbackup
+              instance: oneshot-never
+              pgbackup_operation: backup
+              severity: critical
+            exp_annotations:
+              summary: "No successful backup of pgbackup/oneshot-never in 26 hours"
+              description: "pgbackup/oneshot-never has not reported a successful backup in the last 26 hours. Check the logs of the latest runs and their pgbackup-result lines."
+          - exp_labels:
+              job: pgbackup
+              instance: sched-never
+              pgbackup_operation: backup
+              severity: critical
+            exp_annotations:
+              summary: "No successful backup of pgbackup/sched-never in 26 hours"
+              description: "pgbackup/sched-never has not reported a successful backup in the last 26 hours. Check the logs of the latest runs and their pgbackup-result lines."
+      - eval_time: 1500m
+        alertname: PgBackupLastRunFailed
+        exp_alerts:
+          - exp_labels:
+              job: pgbackup
+              instance: oneshot-never
+              pgbackup_operation: backup
+              severity: warning
+            exp_annotations:
+              summary: "Last backup of pgbackup/oneshot-never failed"
+              description: "The latest backup of pgbackup/oneshot-never failed and no backup has succeeded since. Check the failed run's logs or trace."
+          - exp_labels:
+              job: pgbackup
+              instance: sched-never
+              pgbackup_operation: backup
+              severity: warning
+            exp_annotations:
+              summary: "Last backup of pgbackup/sched-never failed"
+              description: "The latest backup of pgbackup/sched-never failed and no backup has succeeded since. Check the failed run's logs or trace."
+      - eval_time: 1500m
+        alertname: PgBackupNotReporting
+        exp_alerts: []
+      - eval_time: 1500m
+        alertname: PgBackupSizeDrop
+        exp_alerts: []
+      - eval_time: 1620m
+        alertname: PgBackupNoRecentSuccess
+        exp_alerts:
+          - exp_labels:
+              job: pgbackup
+              instance: oneshot-never
+              pgbackup_operation: backup
+              severity: critical
+            exp_annotations:
+              summary: "No successful backup of pgbackup/oneshot-never in 26 hours"
+              description: "pgbackup/oneshot-never has not reported a successful backup in the last 26 hours. Check the logs of the latest runs and their pgbackup-result lines."
+          - exp_labels:
+              job: pgbackup
+              instance: sched-never
+              pgbackup_operation: backup
+              severity: critical
+            exp_annotations:
+              summary: "No successful backup of pgbackup/sched-never in 26 hours"
+              description: "pgbackup/sched-never has not reported a successful backup in the last 26 hours. Check the logs of the latest runs and their pgbackup-result lines."
+      - eval_time: 1620m
+        alertname: PgBackupLastRunFailed
+        exp_alerts:
+          - exp_labels:
+              job: pgbackup
+              instance: oneshot-failing
+              pgbackup_operation: backup
+              severity: warning
+            exp_annotations:
+              summary: "Last backup of pgbackup/oneshot-failing failed"
+              description: "The latest backup of pgbackup/oneshot-failing failed and no backup has succeeded since. Check the failed run's logs or trace."
+          - exp_labels:
+              job: pgbackup
+              instance: oneshot-never
+              pgbackup_operation: backup
+              severity: warning
+            exp_annotations:
+              summary: "Last backup of pgbackup/oneshot-never failed"
+              description: "The latest backup of pgbackup/oneshot-never failed and no backup has succeeded since. Check the failed run's logs or trace."
+          - exp_labels:
+              job: pgbackup
+              instance: sched-failing
+              pgbackup_operation: backup
+              severity: warning
+            exp_annotations:
+              summary: "Last backup of pgbackup/sched-failing failed"
+              description: "The latest backup of pgbackup/sched-failing failed and no backup has succeeded since. Check the failed run's logs or trace."
+          - exp_labels:
+              job: pgbackup
+              instance: sched-never
+              pgbackup_operation: backup
+              severity: warning
+            exp_annotations:
+              summary: "Last backup of pgbackup/sched-never failed"
+              description: "The latest backup of pgbackup/sched-never failed and no backup has succeeded since. Check the failed run's logs or trace."
+      - eval_time: 1620m
+        alertname: PgBackupNotReporting
+        exp_alerts: []
+      - eval_time: 1620m
+        alertname: PgBackupSizeDrop
+        exp_alerts: []
+      - eval_time: 3060m
+        alertname: PgBackupNoRecentSuccess
+        exp_alerts:
+          - exp_labels:
+              job: pgbackup
+              instance: oneshot-failing
+              pgbackup_operation: backup
+              severity: critical
+            exp_annotations:
+              summary: "No successful backup of pgbackup/oneshot-failing in 26 hours"
+              description: "pgbackup/oneshot-failing has not reported a successful backup in the last 26 hours. Check the logs of the latest runs and their pgbackup-result lines."
+          - exp_labels:
+              job: pgbackup
+              instance: oneshot-never
+              pgbackup_operation: backup
+              severity: critical
+            exp_annotations:
+              summary: "No successful backup of pgbackup/oneshot-never in 26 hours"
+              description: "pgbackup/oneshot-never has not reported a successful backup in the last 26 hours. Check the logs of the latest runs and their pgbackup-result lines."
+          - exp_labels:
+              job: pgbackup
+              instance: sched-failing
+              pgbackup_operation: backup
+              severity: critical
+            exp_annotations:
+              summary: "No successful backup of pgbackup/sched-failing in 26 hours"
+              description: "pgbackup/sched-failing has not reported a successful backup in the last 26 hours. Check the logs of the latest runs and their pgbackup-result lines."
+          - exp_labels:
+              job: pgbackup
+              instance: sched-never
+              pgbackup_operation: backup
+              severity: critical
+            exp_annotations:
+              summary: "No successful backup of pgbackup/sched-never in 26 hours"
+              description: "pgbackup/sched-never has not reported a successful backup in the last 26 hours. Check the logs of the latest runs and their pgbackup-result lines."
+      - eval_time: 3060m
+        alertname: PgBackupLastRunFailed
+        exp_alerts:
+          - exp_labels:
+              job: pgbackup
+              instance: oneshot-failing
+              pgbackup_operation: backup
+              severity: warning
+            exp_annotations:
+              summary: "Last backup of pgbackup/oneshot-failing failed"
+              description: "The latest backup of pgbackup/oneshot-failing failed and no backup has succeeded since. Check the failed run's logs or trace."
+          - exp_labels:
+              job: pgbackup
+              instance: oneshot-never
+              pgbackup_operation: backup
+              severity: warning
+            exp_annotations:
+              summary: "Last backup of pgbackup/oneshot-never failed"
+              description: "The latest backup of pgbackup/oneshot-never failed and no backup has succeeded since. Check the failed run's logs or trace."
+          - exp_labels:
+              job: pgbackup
+              instance: sched-failing
+              pgbackup_operation: backup
+              severity: warning
+            exp_annotations:
+              summary: "Last backup of pgbackup/sched-failing failed"
+              description: "The latest backup of pgbackup/sched-failing failed and no backup has succeeded since. Check the failed run's logs or trace."
+          - exp_labels:
+              job: pgbackup
+              instance: sched-never
+              pgbackup_operation: backup
+              severity: warning
+            exp_annotations:
+              summary: "Last backup of pgbackup/sched-never failed"
+              description: "The latest backup of pgbackup/sched-never failed and no backup has succeeded since. Check the failed run's logs or trace."
+      - eval_time: 3060m
+        alertname: PgBackupNotReporting
+        exp_alerts: []
+      - eval_time: 3060m
+        alertname: PgBackupSizeDrop
+        exp_alerts: []
+      - eval_time: 3200m
+        alertname: PgBackupNoRecentSuccess
+        exp_alerts:
+          - exp_labels:
+              job: pgbackup
+              instance: oneshot-failing
+              pgbackup_operation: backup
+              severity: critical
+            exp_annotations:
+              summary: "No successful backup of pgbackup/oneshot-failing in 26 hours"
+              description: "pgbackup/oneshot-failing has not reported a successful backup in the last 26 hours. Check the logs of the latest runs and their pgbackup-result lines."
+          - exp_labels:
+              job: pgbackup
+              instance: oneshot-never
+              pgbackup_operation: backup
+              severity: critical
+            exp_annotations:
+              summary: "No successful backup of pgbackup/oneshot-never in 26 hours"
+              description: "pgbackup/oneshot-never has not reported a successful backup in the last 26 hours. Check the logs of the latest runs and their pgbackup-result lines."
+          - exp_labels:
+              job: pgbackup
+              instance: oneshot-stopped
+              pgbackup_operation: backup
+              severity: critical
+            exp_annotations:
+              summary: "No successful backup of pgbackup/oneshot-stopped in 26 hours"
+              description: "pgbackup/oneshot-stopped has not reported a successful backup in the last 26 hours. Check the logs of the latest runs and their pgbackup-result lines."
+          - exp_labels:
+              job: pgbackup
+              instance: sched-failing
+              pgbackup_operation: backup
+              severity: critical
+            exp_annotations:
+              summary: "No successful backup of pgbackup/sched-failing in 26 hours"
+              description: "pgbackup/sched-failing has not reported a successful backup in the last 26 hours. Check the logs of the latest runs and their pgbackup-result lines."
+          - exp_labels:
+              job: pgbackup
+              instance: sched-never
+              pgbackup_operation: backup
+              severity: critical
+            exp_annotations:
+              summary: "No successful backup of pgbackup/sched-never in 26 hours"
+              description: "pgbackup/sched-never has not reported a successful backup in the last 26 hours. Check the logs of the latest runs and their pgbackup-result lines."
+          - exp_labels:
+              job: pgbackup
+              instance: sched-stopped
+              pgbackup_operation: backup
+              severity: critical
+            exp_annotations:
+              summary: "No successful backup of pgbackup/sched-stopped in 26 hours"
+              description: "pgbackup/sched-stopped has not reported a successful backup in the last 26 hours. Check the logs of the latest runs and their pgbackup-result lines."
+      - eval_time: 3200m
+        alertname: PgBackupLastRunFailed
+        exp_alerts:
+          - exp_labels:
+              job: pgbackup
+              instance: oneshot-failing
+              pgbackup_operation: backup
+              severity: warning
+            exp_annotations:
+              summary: "Last backup of pgbackup/oneshot-failing failed"
+              description: "The latest backup of pgbackup/oneshot-failing failed and no backup has succeeded since. Check the failed run's logs or trace."
+          - exp_labels:
+              job: pgbackup
+              instance: oneshot-never
+              pgbackup_operation: backup
+              severity: warning
+            exp_annotations:
+              summary: "Last backup of pgbackup/oneshot-never failed"
+              description: "The latest backup of pgbackup/oneshot-never failed and no backup has succeeded since. Check the failed run's logs or trace."
+          - exp_labels:
+              job: pgbackup
+              instance: sched-failing
+              pgbackup_operation: backup
+              severity: warning
+            exp_annotations:
+              summary: "Last backup of pgbackup/sched-failing failed"
+              description: "The latest backup of pgbackup/sched-failing failed and no backup has succeeded since. Check the failed run's logs or trace."
+          - exp_labels:
+              job: pgbackup
+              instance: sched-never
+              pgbackup_operation: backup
+              severity: warning
+            exp_annotations:
+              summary: "Last backup of pgbackup/sched-never failed"
+              description: "The latest backup of pgbackup/sched-never failed and no backup has succeeded since. Check the failed run's logs or trace."
+      - eval_time: 3200m
+        alertname: PgBackupNotReporting
+        exp_alerts:
+          - exp_labels:
+              job: pgbackup
+              instance: oneshot-stopped
+              pgbackup_operation: backup
+              severity: warning
+            exp_annotations:
+              summary: "No backup runs from pgbackup/oneshot-stopped in 26 hours"
+              description: "pgbackup/oneshot-stopped reported backup runs in the last 8 days but none in the last 26 hours. The job may be suspended or deleted, or its metrics may not reach Prometheus."
+      - eval_time: 3200m
+        alertname: PgBackupSizeDrop
+        exp_alerts: []
+      - eval_time: 3600m
+        alertname: PgBackupNoRecentSuccess
+        exp_alerts:
+          - exp_labels:
+              job: pgbackup
+              instance: oneshot-failing
+              pgbackup_operation: backup
+              severity: critical
+            exp_annotations:
+              summary: "No successful backup of pgbackup/oneshot-failing in 26 hours"
+              description: "pgbackup/oneshot-failing has not reported a successful backup in the last 26 hours. Check the logs of the latest runs and their pgbackup-result lines."
+          - exp_labels:
+              job: pgbackup
+              instance: oneshot-never
+              pgbackup_operation: backup
+              severity: critical
+            exp_annotations:
+              summary: "No successful backup of pgbackup/oneshot-never in 26 hours"
+              description: "pgbackup/oneshot-never has not reported a successful backup in the last 26 hours. Check the logs of the latest runs and their pgbackup-result lines."
+          - exp_labels:
+              job: pgbackup
+              instance: oneshot-stopped
+              pgbackup_operation: backup
+              severity: critical
+            exp_annotations:
+              summary: "No successful backup of pgbackup/oneshot-stopped in 26 hours"
+              description: "pgbackup/oneshot-stopped has not reported a successful backup in the last 26 hours. Check the logs of the latest runs and their pgbackup-result lines."
+          - exp_labels:
+              job: pgbackup
+              instance: sched-failing
+              pgbackup_operation: backup
+              severity: critical
+            exp_annotations:
+              summary: "No successful backup of pgbackup/sched-failing in 26 hours"
+              description: "pgbackup/sched-failing has not reported a successful backup in the last 26 hours. Check the logs of the latest runs and their pgbackup-result lines."
+          - exp_labels:
+              job: pgbackup
+              instance: sched-never
+              pgbackup_operation: backup
+              severity: critical
+            exp_annotations:
+              summary: "No successful backup of pgbackup/sched-never in 26 hours"
+              description: "pgbackup/sched-never has not reported a successful backup in the last 26 hours. Check the logs of the latest runs and their pgbackup-result lines."
+          - exp_labels:
+              job: pgbackup
+              instance: sched-stopped
+              pgbackup_operation: backup
+              severity: critical
+            exp_annotations:
+              summary: "No successful backup of pgbackup/sched-stopped in 26 hours"
+              description: "pgbackup/sched-stopped has not reported a successful backup in the last 26 hours. Check the logs of the latest runs and their pgbackup-result lines."
+      - eval_time: 3600m
+        alertname: PgBackupLastRunFailed
+        exp_alerts:
+          - exp_labels:
+              job: pgbackup
+              instance: oneshot-failing
+              pgbackup_operation: backup
+              severity: warning
+            exp_annotations:
+              summary: "Last backup of pgbackup/oneshot-failing failed"
+              description: "The latest backup of pgbackup/oneshot-failing failed and no backup has succeeded since. Check the failed run's logs or trace."
+          - exp_labels:
+              job: pgbackup
+              instance: oneshot-never
+              pgbackup_operation: backup
+              severity: warning
+            exp_annotations:
+              summary: "Last backup of pgbackup/oneshot-never failed"
+              description: "The latest backup of pgbackup/oneshot-never failed and no backup has succeeded since. Check the failed run's logs or trace."
+          - exp_labels:
+              job: pgbackup
+              instance: sched-failing
+              pgbackup_operation: backup
+              severity: warning
+            exp_annotations:
+              summary: "Last backup of pgbackup/sched-failing failed"
+              description: "The latest backup of pgbackup/sched-failing failed and no backup has succeeded since. Check the failed run's logs or trace."
+          - exp_labels:
+              job: pgbackup
+              instance: sched-never
+              pgbackup_operation: backup
+              severity: warning
+            exp_annotations:
+              summary: "Last backup of pgbackup/sched-never failed"
+              description: "The latest backup of pgbackup/sched-never failed and no backup has succeeded since. Check the failed run's logs or trace."
+      - eval_time: 3600m
+        alertname: PgBackupNotReporting
+        exp_alerts:
+          - exp_labels:
+              job: pgbackup
+              instance: oneshot-stopped
+              pgbackup_operation: backup
+              severity: warning
+            exp_annotations:
+              summary: "No backup runs from pgbackup/oneshot-stopped in 26 hours"
+              description: "pgbackup/oneshot-stopped reported backup runs in the last 8 days but none in the last 26 hours. The job may be suspended or deleted, or its metrics may not reach Prometheus."
+          - exp_labels:
+              job: pgbackup
+              instance: sched-stopped
+              pgbackup_operation: backup
+              severity: warning
+            exp_annotations:
+              summary: "No backup runs from pgbackup/sched-stopped in 26 hours"
+              description: "pgbackup/sched-stopped reported backup runs in the last 8 days but none in the last 26 hours. The job may be suspended or deleted, or its metrics may not reach Prometheus."
+      - eval_time: 3600m
+        alertname: PgBackupSizeDrop
+        exp_alerts: []
+      - eval_time: 4445m
+        alertname: PgBackupNoRecentSuccess
+        exp_alerts:
+          - exp_labels:
+              job: pgbackup
+              instance: oneshot-failing
+              pgbackup_operation: backup
+              severity: critical
+            exp_annotations:
+              summary: "No successful backup of pgbackup/oneshot-failing in 26 hours"
+              description: "pgbackup/oneshot-failing has not reported a successful backup in the last 26 hours. Check the logs of the latest runs and their pgbackup-result lines."
+          - exp_labels:
+              job: pgbackup
+              instance: oneshot-never
+              pgbackup_operation: backup
+              severity: critical
+            exp_annotations:
+              summary: "No successful backup of pgbackup/oneshot-never in 26 hours"
+              description: "pgbackup/oneshot-never has not reported a successful backup in the last 26 hours. Check the logs of the latest runs and their pgbackup-result lines."
+          - exp_labels:
+              job: pgbackup
+              instance: oneshot-stopped
+              pgbackup_operation: backup
+              severity: critical
+            exp_annotations:
+              summary: "No successful backup of pgbackup/oneshot-stopped in 26 hours"
+              description: "pgbackup/oneshot-stopped has not reported a successful backup in the last 26 hours. Check the logs of the latest runs and their pgbackup-result lines."
+          - exp_labels:
+              job: pgbackup
+              instance: sched-failing
+              pgbackup_operation: backup
+              severity: critical
+            exp_annotations:
+              summary: "No successful backup of pgbackup/sched-failing in 26 hours"
+              description: "pgbackup/sched-failing has not reported a successful backup in the last 26 hours. Check the logs of the latest runs and their pgbackup-result lines."
+          - exp_labels:
+              job: pgbackup
+              instance: sched-never
+              pgbackup_operation: backup
+              severity: critical
+            exp_annotations:
+              summary: "No successful backup of pgbackup/sched-never in 26 hours"
+              description: "pgbackup/sched-never has not reported a successful backup in the last 26 hours. Check the logs of the latest runs and their pgbackup-result lines."
+          - exp_labels:
+              job: pgbackup
+              instance: sched-stopped
+              pgbackup_operation: backup
+              severity: critical
+            exp_annotations:
+              summary: "No successful backup of pgbackup/sched-stopped in 26 hours"
+              description: "pgbackup/sched-stopped has not reported a successful backup in the last 26 hours. Check the logs of the latest runs and their pgbackup-result lines."
+      - eval_time: 4445m
+        alertname: PgBackupLastRunFailed
+        exp_alerts:
+          - exp_labels:
+              job: pgbackup
+              instance: oneshot-failing
+              pgbackup_operation: backup
+              severity: warning
+            exp_annotations:
+              summary: "Last backup of pgbackup/oneshot-failing failed"
+              description: "The latest backup of pgbackup/oneshot-failing failed and no backup has succeeded since. Check the failed run's logs or trace."
+          - exp_labels:
+              job: pgbackup
+              instance: oneshot-never
+              pgbackup_operation: backup
+              severity: warning
+            exp_annotations:
+              summary: "Last backup of pgbackup/oneshot-never failed"
+              description: "The latest backup of pgbackup/oneshot-never failed and no backup has succeeded since. Check the failed run's logs or trace."
+          - exp_labels:
+              job: pgbackup
+              instance: sched-failing
+              pgbackup_operation: backup
+              severity: warning
+            exp_annotations:
+              summary: "Last backup of pgbackup/sched-failing failed"
+              description: "The latest backup of pgbackup/sched-failing failed and no backup has succeeded since. Check the failed run's logs or trace."
+          - exp_labels:
+              job: pgbackup
+              instance: sched-never
+              pgbackup_operation: backup
+              severity: warning
+            exp_annotations:
+              summary: "Last backup of pgbackup/sched-never failed"
+              description: "The latest backup of pgbackup/sched-never failed and no backup has succeeded since. Check the failed run's logs or trace."
+      - eval_time: 4445m
+        alertname: PgBackupNotReporting
+        exp_alerts:
+          - exp_labels:
+              job: pgbackup
+              instance: oneshot-stopped
+              pgbackup_operation: backup
+              severity: warning
+            exp_annotations:
+              summary: "No backup runs from pgbackup/oneshot-stopped in 26 hours"
+              description: "pgbackup/oneshot-stopped reported backup runs in the last 8 days but none in the last 26 hours. The job may be suspended or deleted, or its metrics may not reach Prometheus."
+          - exp_labels:
+              job: pgbackup
+              instance: sched-stopped
+              pgbackup_operation: backup
+              severity: warning
+            exp_annotations:
+              summary: "No backup runs from pgbackup/sched-stopped in 26 hours"
+              description: "pgbackup/sched-stopped reported backup runs in the last 8 days but none in the last 26 hours. The job may be suspended or deleted, or its metrics may not reach Prometheus."
+      - eval_time: 4445m
+        alertname: PgBackupSizeDrop
+        exp_alerts:
+          - exp_labels:
+              job: pgbackup
+              instance: oneshot-drop
+              severity: warning
+            exp_annotations:
+              summary: "Backup of pgbackup/oneshot-drop shrank by more than half"
+              description: "The latest backup of pgbackup/oneshot-drop is less than half the size of the largest backup in the 2 days before it. Check that the database and the dump are complete."
+          - exp_labels:
+              job: pgbackup
+              instance: sched-drop
+              severity: warning
+            exp_annotations:
+              summary: "Backup of pgbackup/sched-drop shrank by more than half"
+              description: "The latest backup of pgbackup/sched-drop is less than half the size of the largest backup in the 2 days before it. Check that the database and the dump are complete."
+      - eval_time: 4500m
+        alertname: PgBackupNoRecentSuccess
+        exp_alerts:
+          - exp_labels:
+              job: pgbackup
+              instance: oneshot-failing
+              pgbackup_operation: backup
+              severity: critical
+            exp_annotations:
+              summary: "No successful backup of pgbackup/oneshot-failing in 26 hours"
+              description: "pgbackup/oneshot-failing has not reported a successful backup in the last 26 hours. Check the logs of the latest runs and their pgbackup-result lines."
+          - exp_labels:
+              job: pgbackup
+              instance: oneshot-never
+              pgbackup_operation: backup
+              severity: critical
+            exp_annotations:
+              summary: "No successful backup of pgbackup/oneshot-never in 26 hours"
+              description: "pgbackup/oneshot-never has not reported a successful backup in the last 26 hours. Check the logs of the latest runs and their pgbackup-result lines."
+          - exp_labels:
+              job: pgbackup
+              instance: oneshot-stopped
+              pgbackup_operation: backup
+              severity: critical
+            exp_annotations:
+              summary: "No successful backup of pgbackup/oneshot-stopped in 26 hours"
+              description: "pgbackup/oneshot-stopped has not reported a successful backup in the last 26 hours. Check the logs of the latest runs and their pgbackup-result lines."
+          - exp_labels:
+              job: pgbackup
+              instance: sched-failing
+              pgbackup_operation: backup
+              severity: critical
+            exp_annotations:
+              summary: "No successful backup of pgbackup/sched-failing in 26 hours"
+              description: "pgbackup/sched-failing has not reported a successful backup in the last 26 hours. Check the logs of the latest runs and their pgbackup-result lines."
+          - exp_labels:
+              job: pgbackup
+              instance: sched-never
+              pgbackup_operation: backup
+              severity: critical
+            exp_annotations:
+              summary: "No successful backup of pgbackup/sched-never in 26 hours"
+              description: "pgbackup/sched-never has not reported a successful backup in the last 26 hours. Check the logs of the latest runs and their pgbackup-result lines."
+          - exp_labels:
+              job: pgbackup
+              instance: sched-stopped
+              pgbackup_operation: backup
+              severity: critical
+            exp_annotations:
+              summary: "No successful backup of pgbackup/sched-stopped in 26 hours"
+              description: "pgbackup/sched-stopped has not reported a successful backup in the last 26 hours. Check the logs of the latest runs and their pgbackup-result lines."
+      - eval_time: 4500m
+        alertname: PgBackupLastRunFailed
+        exp_alerts:
+          - exp_labels:
+              job: pgbackup
+              instance: oneshot-failing
+              pgbackup_operation: backup
+              severity: warning
+            exp_annotations:
+              summary: "Last backup of pgbackup/oneshot-failing failed"
+              description: "The latest backup of pgbackup/oneshot-failing failed and no backup has succeeded since. Check the failed run's logs or trace."
+          - exp_labels:
+              job: pgbackup
+              instance: oneshot-never
+              pgbackup_operation: backup
+              severity: warning
+            exp_annotations:
+              summary: "Last backup of pgbackup/oneshot-never failed"
+              description: "The latest backup of pgbackup/oneshot-never failed and no backup has succeeded since. Check the failed run's logs or trace."
+          - exp_labels:
+              job: pgbackup
+              instance: sched-failing
+              pgbackup_operation: backup
+              severity: warning
+            exp_annotations:
+              summary: "Last backup of pgbackup/sched-failing failed"
+              description: "The latest backup of pgbackup/sched-failing failed and no backup has succeeded since. Check the failed run's logs or trace."
+          - exp_labels:
+              job: pgbackup
+              instance: sched-never
+              pgbackup_operation: backup
+              severity: warning
+            exp_annotations:
+              summary: "Last backup of pgbackup/sched-never failed"
+              description: "The latest backup of pgbackup/sched-never failed and no backup has succeeded since. Check the failed run's logs or trace."
+      - eval_time: 4500m
+        alertname: PgBackupNotReporting
+        exp_alerts:
+          - exp_labels:
+              job: pgbackup
+              instance: oneshot-stopped
+              pgbackup_operation: backup
+              severity: warning
+            exp_annotations:
+              summary: "No backup runs from pgbackup/oneshot-stopped in 26 hours"
+              description: "pgbackup/oneshot-stopped reported backup runs in the last 8 days but none in the last 26 hours. The job may be suspended or deleted, or its metrics may not reach Prometheus."
+          - exp_labels:
+              job: pgbackup
+              instance: sched-stopped
+              pgbackup_operation: backup
+              severity: warning
+            exp_annotations:
+              summary: "No backup runs from pgbackup/sched-stopped in 26 hours"
+              description: "pgbackup/sched-stopped reported backup runs in the last 8 days but none in the last 26 hours. The job may be suspended or deleted, or its metrics may not reach Prometheus."
+      - eval_time: 4500m
+        alertname: PgBackupSizeDrop
+        exp_alerts:
+          - exp_labels:
+              job: pgbackup
+              instance: oneshot-drop
+              severity: warning
+            exp_annotations:
+              summary: "Backup of pgbackup/oneshot-drop shrank by more than half"
+              description: "The latest backup of pgbackup/oneshot-drop is less than half the size of the largest backup in the 2 days before it. Check that the database and the dump are complete."
+          - exp_labels:
+              job: pgbackup
+              instance: sched-drop
+              severity: warning
+            exp_annotations:
+              summary: "Backup of pgbackup/sched-drop shrank by more than half"
+              description: "The latest backup of pgbackup/sched-drop is less than half the size of the largest backup in the 2 days before it. Check that the database and the dump are complete."
