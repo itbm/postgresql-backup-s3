@@ -30,12 +30,12 @@ _rst_assert_db_absent() {
   fi
 }
 
-# _rst_put_gz <bucket> <key> <text> - uploads text gzipped with the image's gzip,
-# so the host needs nothing beyond Docker.
-_rst_put_gz() {
-  printf '%s\n' "$3" | docker run --rm -i --label "e2e.run=$E2E_RUN_ID" --entrypoint gzip "$E2E_IMAGE" -c \
-    >"$CASE_DIR/upload.gz" || fail "could not gzip upload for $2"
-  s3_put "$1" "$2" "$CASE_DIR/upload.gz"
+# _rst_put_compressed <bucket> <key> <text> [compressor] - uploads text compressed
+# with the image's gzip (default) or bzip2, so the host needs nothing beyond Docker.
+_rst_put_compressed() {
+  printf '%s\n' "$3" | docker run --rm -i --label "e2e.run=$E2E_RUN_ID" --entrypoint "${4:-gzip}" "$E2E_IMAGE" -c \
+    >"$CASE_DIR/upload.bin" || fail "could not compress upload for $2"
+  s3_put "$1" "$2" "$CASE_DIR/upload.bin"
 }
 
 # _rst_truncate <bucket> <key> <new-key> - uploads the first half of an object.
@@ -53,7 +53,7 @@ _rst_hold_connection() {
   _rh_app="e2e_rst_hold_$(printf '%s' "$CASE_SLUG" | tr '-' '_')"
   trap _rst_release EXIT
   docker exec -d -e "PGAPPNAME=$_rh_app" "$E2E_PG_CTR" psql -X -q -U postgres -d "$1" \
-    -c 'SELECT pg_sleep(60)' || fail "could not open the extra session"
+    -c 'SELECT pg_sleep(600)' || fail "could not open the extra session"
   wait_for 30 _rst_holding_at_least 1 || fail "extra session did not connect to $1"
 }
 
@@ -68,6 +68,35 @@ _rst_holding_at_least() {
 _rst_release() {
   psql_exec postgres "SELECT pg_terminate_backend(pid) FROM pg_stat_activity
     WHERE application_name = '$_rh_app'" >/dev/null 2>&1
+}
+
+# _rst_probe_logins <database> - a login event trigger records every session
+# that connects, so a test can count pg_restore's connections without racing
+# the restore. Needs PostgreSQL 17+; on older servers nothing is counted.
+_rst_probe_logins() {
+  if [ "$(psql_exec postgres 'SHOW server_version_num')" -lt 170000 ]; then
+    note "server older than PostgreSQL 17: pg_restore sessions are not counted"
+    return 0
+  fi
+  psql_exec "$1" "CREATE SCHEMA rst_probe;
+    CREATE TABLE rst_probe.logins (pid integer, app text);
+    CREATE FUNCTION rst_probe.record_login() RETURNS event_trigger LANGUAGE plpgsql AS
+      'BEGIN INSERT INTO rst_probe.logins VALUES (pg_backend_pid(), current_setting(''application_name'')); END';
+    CREATE EVENT TRIGGER rst_probe_login ON login EXECUTE FUNCTION rst_probe.record_login()" >/dev/null \
+    || fail "could not add the login probe to $1"
+}
+
+# _rst_probe_check <database> <test-op> <n> <what> - checks the number of
+# pg_restore sessions the probe saw (for example -ge 5), then removes the probe
+# so the database can be compared with its source.
+_rst_probe_check() {
+  [ "$(psql_exec "$1" "SELECT count(*) FROM pg_namespace WHERE nspname = 'rst_probe'")" = 1 ] || return 0
+  _rpc_n=$(psql_exec "$1" "SELECT count(DISTINCT pid) FROM rst_probe.logins WHERE app = 'pg_restore'") \
+    || fail "could not read the login probe in $1"
+  psql_exec "$1" "SET client_min_messages = warning;
+    DROP EVENT TRIGGER rst_probe_login; DROP SCHEMA rst_probe CASCADE" >/dev/null \
+    || fail "could not remove the login probe from $1"
+  [ "$_rpc_n" "$2" "$3" ] || fail "$4: expected $2 $3 pg_restore sessions, got $_rpc_n"
 }
 
 # ---------------------------------------------------------------------------
@@ -179,7 +208,8 @@ test_restore_drop_terminates_other_sessions() {
   key=$(s3_single_key "$bucket" backup/)
 
   target=$(new_db target)
-  psql_exec "$target" "CREATE TABLE public.added_after_backup (id integer)" >/dev/null
+  psql_exec "$target" "CREATE TABLE public.added_after_backup (id integer)" >/dev/null \
+    || fail "could not modify $target"
   _rst_hold_connection "$target"
 
   bk_restore restore "$target" "$bucket" "$key" -e DROP_DATABASE=yes -e CREATE_DATABASE=yes
@@ -226,7 +256,8 @@ test_restore_quoted_database_names() {
   assert_log_not_contains "WARNING"
   assert_same_data "$src" "$target"
 
-  psql_exec "$target" "CREATE TABLE public.added_after_backup (id integer)" >/dev/null
+  psql_exec "$target" "CREATE TABLE public.added_after_backup (id integer)" >/dev/null \
+    || fail "could not modify $target"
   bk_restore custom "$target" "$bucket" "$custom_key" -e DROP_DATABASE=yes -e CREATE_DATABASE=yes \
     -e PARALLEL_JOBS=2
   assert_rc 0 "custom restore over a database whose name needs quoting"
@@ -246,10 +277,13 @@ test_restore_custom_format_parallel_jobs() {
   key=$(s3_single_key "$bucket" backup/)
   assert_match "$key" '\.dump$' "custom format key"
 
-  bk_restore default "${db}_default" "$bucket" "$key" -e CREATE_DATABASE=yes
+  _rst_empty_db "${db}_default"
+  _rst_probe_logins "${db}_default"
+  bk_restore default "${db}_default" "$bucket" "$key"
   assert_rc 0 "custom restore with the default PARALLEL_JOBS"
   assert_log_contains "Restoring database ${db}_default from custom format"
   assert_log_not_contains "Using parallel restore"
+  _rst_probe_check "${db}_default" -eq 1 "serial restore"
   assert_same_data "$db" "${db}_default"
 
   bk_restore one "${db}_one" "$bucket" "$key" -e CREATE_DATABASE=yes -e PARALLEL_JOBS=1
@@ -257,9 +291,13 @@ test_restore_custom_format_parallel_jobs() {
   assert_log_not_contains "Using parallel restore"
   assert_same_data "$db" "${db}_one"
 
-  bk_restore four "${db}_four" "$bucket" "$key" -e CREATE_DATABASE=yes -e PARALLEL_JOBS=4
+  _rst_empty_db "${db}_four"
+  _rst_probe_logins "${db}_four"
+  bk_restore four "${db}_four" "$bucket" "$key" -e PARALLEL_JOBS=4
   assert_rc 0 "custom restore with PARALLEL_JOBS=4"
   assert_log_contains "Using parallel restore with 4 jobs"
+  # pg_restore -j N opens one session per worker plus the leader's.
+  _rst_probe_check "${db}_four" -ge 5 "PARALLEL_JOBS=4"
   assert_same_data "$db" "${db}_four"
   assert_eq "$(bk_tmp_leftovers)" "" "temporary files left in /tmp after restore"
 }
@@ -281,13 +319,16 @@ test_restore_custom_format_errors_fail_restore() {
   _rst_backup backup "$db" "$bucket" -e USE_CUSTOM_FORMAT=yes
   key=$(s3_single_key "$bucket" backup/)
 
-  # The objects already exist, so pg_restore reports errors.
-  target=$(new_db target)
-  bk_restore restore "$target" "$bucket" "$key"
-  assert_rc_nonzero "pg_restore errors should fail the restore"
-  assert_log_contains "errors ignored on restore"
-  assert_log_not_contains "Database restore completed successfully"
-  assert_eq "$(bk_tmp_leftovers)" "" "temporary files left in /tmp after a failed restore"
+  # The objects already exist, so pg_restore reports errors, serial or parallel.
+  for jobs in 1 2; do
+    target=$(new_db "j$jobs")
+    bk_restore "restore-j$jobs" "$target" "$bucket" "$key" -e "PARALLEL_JOBS=$jobs"
+    assert_rc_nonzero "pg_restore errors should fail the restore (PARALLEL_JOBS=$jobs)"
+    assert_log_contains "errors ignored on restore"
+    assert_log_not_contains "Database restore completed successfully"
+    assert_eq "$(bk_tmp_leftovers)" "" "temporary files left in /tmp after a failed restore"
+  done
+  assert_log_contains "Using parallel restore with 2 jobs"
 }
 
 # ---------------------------------------------------------------------------
@@ -344,8 +385,10 @@ test_restore_all_databases_into_fresh_server() {
   PG_CTR=$src psql_exec postgres "CREATE DATABASE $db" >/dev/null || fail "could not create $db"
   docker exec -i "$src" psql -X -q -U postgres -d "$db" -v ON_ERROR_STOP=1 -f - \
     <"$E2E_DIR/fixtures/seed.sql" >/dev/null || fail "could not load seed data into $db"
-  PG_CTR=$src psql_exec postgres "CREATE ROLE rst_all_owner LOGIN PASSWORD 'rst-owner-pw'" >/dev/null
-  PG_CTR=$src psql_exec postgres "CREATE DATABASE $(sql_ident "$other") OWNER rst_all_owner" >/dev/null
+  PG_CTR=$src psql_exec postgres "CREATE ROLE rst_all_owner LOGIN PASSWORD 'rst-owner-pw'" >/dev/null \
+    || fail "could not create role rst_all_owner"
+  PG_CTR=$src psql_exec postgres "CREATE DATABASE $(sql_ident "$other") OWNER rst_all_owner" >/dev/null \
+    || fail "could not create $other"
   PG_CTR=$src psql_exec "$other" "SET ROLE rst_all_owner;
     CREATE TABLE notes (id integer PRIMARY KEY, body text); INSERT INTO notes VALUES (1, 'kept')" >/dev/null \
     || fail "could not fill $other"
@@ -373,6 +416,23 @@ test_restore_all_databases_into_fresh_server() {
   PG_CTR=$src assert_same_data "$db" "$db" "$dst"
 }
 
+test_restore_all_uses_decompression_cmd() {
+  bucket=$(new_bucket)
+  marker=$(printf 't_%s_marker' "$CASE_SLUG" | tr '-' '_')
+  _rst_put_compressed "$bucket" backup/all.sql.gz "CREATE DATABASE $marker;" bzip2
+
+  bk_restore default all "$bucket" backup/all.sql.gz
+  assert_rc_nonzero "default DECOMPRESSION_CMD on bzip2 data with POSTGRES_DATABASE=all"
+  assert_log_contains "Restoring all databases"
+  assert_log_not_contains "Database restore completed successfully"
+  _rst_assert_db_absent "$marker" "nothing should be restored"
+
+  bk_restore bzip2 all "$bucket" backup/all.sql.gz -e "DECOMPRESSION_CMD=bzip2 -dc"
+  assert_rc 0 "restore of all databases with DECOMPRESSION_CMD='bzip2 -dc'"
+  assert_log_contains "Database restore completed successfully"
+  db_exists "$marker" || fail "the bzip2 backup was not restored: $marker is missing"
+}
+
 test_restore_all_rejects_custom_format() {
   bucket=$(new_bucket)
   s3_put_string "$bucket" backup/all_custom.dump "not really a dump"
@@ -388,7 +448,7 @@ test_restore_all_rejects_drop_and_create() {
   bucket=$(new_bucket)
   marker=$(printf 't_%s_marker' "$CASE_SLUG" | tr '-' '_')
   # Restoring this would create the marker database.
-  _rst_put_gz "$bucket" backup/all.sql.gz "CREATE DATABASE $marker;"
+  _rst_put_compressed "$bucket" backup/all.sql.gz "CREATE DATABASE $marker;"
 
   bk_restore drop all "$bucket" backup/all.sql.gz -e DROP_DATABASE=yes
   assert_rc 1 "DROP_DATABASE=yes with POSTGRES_DATABASE=all"
@@ -488,7 +548,8 @@ test_restore_extra_opts_reach_psql_and_pg_restore() {
   assert_log_not_contains "WARNING"
   assert_same_data "$db" "$target"
 
-  psql_exec "$target" "CREATE TABLE public.added_after_backup (id integer)" >/dev/null
+  psql_exec "$target" "CREATE TABLE public.added_after_backup (id integer)" >/dev/null \
+    || fail "could not modify $target"
   bk_restore custom "$target" "$bucket" "$custom_key" -e DROP_DATABASE=yes -e CREATE_DATABASE=yes \
     -e PARALLEL_JOBS=2 -e POSTGRES_PORT=1 -e "POSTGRES_EXTRA_OPTS=-p 5432"
   assert_rc 0 "custom restore with the port from POSTGRES_EXTRA_OPTS"
