@@ -17,15 +17,17 @@ _enc_sh() {
     -c "$_es_script" sh "$@"
 }
 
-# _enc_decrypt <in> <out> <password> - README's manual decrypt command.
+# _enc_decrypt <in> <out> <password> - README's manual decrypt command as any
+# OpenSSL 1.1 or later runs it. The digest is named (SHA-256, their default) so
+# that a change of the image's own default cannot slip through unnoticed.
 _enc_decrypt() {
-  _enc_sh 'export PW=$1; openssl enc -aes-256-cbc -d -pbkdf2 -iter 100000 -pass env:PW 2>/dev/null' \
+  _enc_sh 'export PW=$1; openssl enc -aes-256-cbc -d -pbkdf2 -iter 100000 -md sha256 -pass env:PW 2>/dev/null' \
     "$3" <"$1" >"$2"
 }
 
 # _enc_decrypt_legacy <in> <out> <password> - the pre-PBKDF2 key derivation.
 _enc_decrypt_legacy() {
-  _enc_sh 'export PW=$1; openssl enc -aes-256-cbc -d -pass env:PW 2>/dev/null' "$3" <"$1" >"$2"
+  _enc_sh 'export PW=$1; openssl enc -aes-256-cbc -d -md sha256 -pass env:PW 2>/dev/null' "$3" <"$1" >"$2"
 }
 
 _enc_assert_salted() {
@@ -40,17 +42,19 @@ _enc_assert_gzip_has_line() {
 }
 
 # _enc_legacy_encrypt <in> <out> <password> - encrypts as releases before PBKDF2
-# did (openssl enc -aes-256-cbc -k: salted, one round of SHA-256). openssl leaves
-# out the Salted__ header when given -S, so it is written here. The salt is the
-# first of a fixed list for which restore.sh's PBKDF2 attempt fails, as it does
-# for about 255 salts in 256; the other case has its own test.
+# did (openssl enc -aes-256-cbc -k: salted, one round of SHA-256). The digest is
+# named rather than left to the image's openssl default, which restore.sh relies
+# on, so a change of that default fails the legacy tests. openssl leaves out the
+# Salted__ header when given -S, so it is written here. The salt is the first of
+# a fixed list for which restore.sh's PBKDF2 attempt fails, as it does for about
+# 255 salts in 256; the other case has its own test.
 _enc_legacy_encrypt() {
   _enc_sh '
     export PW=$1
     cat >/tmp/plain
     for salt in e2e1000000000000 e2e1000000000001 e2e1000000000002 e2e1000000000003; do
       { printf Salted__; printf %s "$salt" | xxd -r -p
-        openssl enc -aes-256-cbc -S "$salt" -pass env:PW -in /tmp/plain 2>/dev/null; } >/tmp/enc || exit 1
+        openssl enc -aes-256-cbc -md sha256 -S "$salt" -pass env:PW -in /tmp/plain 2>/dev/null; } >/tmp/enc || exit 1
       if ! openssl enc -aes-256-cbc -d -pbkdf2 -iter 100000 -pass env:PW -in /tmp/enc -out /dev/null 2>/dev/null; then
         cat /tmp/enc
         exit 0
@@ -87,8 +91,8 @@ _enc_fixture_sql() {
 
 # _enc_fixture_backup <out> <password> <salt> [openssl options...] - the fixture
 # SQL as gzip with a single stored block (the same bytes whatever gzip the image
-# ships), encrypted with a fixed salt. Without options it uses the legacy key
-# derivation; pass -pbkdf2 -iter 100000 for the current format.
+# ships), encrypted with a fixed salt and SHA-256. Without options it uses the
+# legacy key derivation; pass -pbkdf2 -iter 100000 for the current format.
 _enc_fixture_backup() {
   _ef_out=$1
   shift
@@ -107,7 +111,7 @@ _enc_fixture_backup() {
     shift 2
     printf Salted__
     printf %s "$salt" | xxd -r -p
-    openssl enc -aes-256-cbc -S "$salt" "$@" -pass env:PW -in /tmp/plain.gz 2>/dev/null' "$@" >"$_ef_out" \
+    openssl enc -aes-256-cbc -md sha256 -S "$salt" "$@" -pass env:PW -in /tmp/plain.gz 2>/dev/null' "$@" >"$_ef_out" \
     || fail "could not build the fixture backup"
 }
 
@@ -391,6 +395,25 @@ test_encryption_legacy_backup_misread_as_pbkdf2() {
 
 # ---------------------------------------------------------------------------
 # A wrong password that slips through the CBC padding check (about 2 in 256).
+
+# Current-format backups written outside the image with SHA-256, as every PBKDF2
+# release wrote them. They are also the fixtures of the two tests that follow,
+# which this shows to be sound.
+test_encryption_pbkdf2_fixtures_restore_with_right_password() {
+  bucket=$(new_bucket)
+  for salt in e2e0000000000212 e2e00000000000cd; do
+    target=$(_enc_new_db_name "$salt")
+    _enc_fixture_backup "$CASE_DIR/$salt.enc" "$_ENC_PASSWORD" "$salt" -pbkdf2 -iter 100000
+    s3_put "$bucket" "backup/$salt.sql.gz.enc" "$CASE_DIR/$salt.enc"
+
+    bk_restore "restore-$salt" "$target" "$bucket" "backup/$salt.sql.gz.enc" \
+      -e "ENCRYPTION_PASSWORD=$_ENC_PASSWORD" -e CREATE_DATABASE=yes
+    assert_rc 0 "restore of the PBKDF2 fixture with salt $salt"
+    assert_log_contains "Decrypting backup file"
+    assert_log_not_contains "WARNING: Decrypted legacy"
+    assert_eq "$(_enc_fixture_rows "$target")" "1:alpha,2:beta,3:gamma" "restored fixture rows (salt $salt)"
+  done
+}
 
 test_encryption_wrong_password_passing_pbkdf2_padding_keeps_database() {
   xfail "a wrong password whose PBKDF2 decrypt passes the CBC padding check (about 1 in 256) is not detected, so DROP_DATABASE=yes drops the database before the restore fails"
