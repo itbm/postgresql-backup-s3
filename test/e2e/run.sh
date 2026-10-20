@@ -173,9 +173,9 @@ infra_run() {
 infra_run pg -e "POSTGRES_PASSWORD=$PG_PASSWORD" "$E2E_POSTGRES_IMAGE" \
   -c fsync=off -c full_page_writes=off -c synchronous_commit=off
 infra_run minio -e "MINIO_ROOT_USER=$S3_KEY" -e "MINIO_ROOT_PASSWORD=$S3_SECRET" \
-  "$E2E_MINIO_IMAGE" server /data
+  "$E2E_MINIO_IMAGE" server /data --console-address :9001
 infra_run minio-tls -e "MINIO_ROOT_USER=$S3_KEY" -e "MINIO_ROOT_PASSWORD=$S3_SECRET" \
-  -v "$E2E_CERTS:/certs:ro" "$E2E_MINIO_IMAGE" server /data --certs-dir /certs
+  -v "$E2E_CERTS:/certs:ro" "$E2E_MINIO_IMAGE" server /data --certs-dir /certs --console-address :9001
 mkdir -p "$E2E_WORK/hook-server"
 chmod 777 "$E2E_WORK/hook-server"
 infra_run hooks -v "$E2E_DIR/hook_server.py:/srv/hook_server.py:ro" -v "$E2E_CERTS:/certs:ro" \
