@@ -119,7 +119,7 @@ cleanup() {
     exit "$status"
   fi
   ids=$(docker ps -aq --filter "label=e2e.run=$E2E_RUN_ID")
-  [ -z "$ids" ] || docker rm -f $ids >/dev/null 2>&1
+  [ -z "$ids" ] || docker rm -f -v $ids >/dev/null 2>&1
   docker network rm "$E2E_NET" >/dev/null 2>&1
   # Containers write root-owned files into the work dir; remove them as root.
   docker run --rm -v "$E2E_WORK:/work" --entrypoint sh "$E2E_IMAGE" \
@@ -229,7 +229,7 @@ for t in "${tests[@]}"; do
   rc=$?
 
   ids=$(docker ps -aq --filter "label=e2e.case=$slug" --filter "label=e2e.run=$E2E_RUN_ID")
-  [ -z "$ids" ] || docker rm -f $ids >/dev/null 2>&1
+  [ -z "$ids" ] || docker rm -f -v $ids >/dev/null 2>&1
 
   took="$((SECONDS - case_start))s"
   show=0
