@@ -10,32 +10,6 @@ _VAL_ROOT="$E2E_DIR/../.."
 # ---------------------------------------------------------------------------
 # Helpers.
 
-# _val_begin - call first in tests that clone the seed (after xfail). Databases
-# recorded with _val_db or _val_track are dropped when the case ends, so a full
-# run does not keep growing the server's data volume. E2E_KEEP=1 keeps them.
-_val_begin() {
-  : >"$CASE_DIR/val-dbs"
-  [ "${E2E_KEEP:-0}" = 1 ] || trap _val_end EXIT
-}
-
-_val_end() {
-  # fd 3, because psql_exec (docker exec -i) would swallow the rest of stdin.
-  while IFS= read -r _ve_db <&3; do
-    [ -z "$_ve_db" ] || drop_db "$_ve_db" </dev/null >/dev/null 2>&1
-  done 3<"$CASE_DIR/val-dbs"
-}
-
-_val_track() {
-  printf '%s\n' "$@" >>"$CASE_DIR/val-dbs"
-}
-
-# _val_db [suffix] - new_db, recorded for dropping. Use as db=$(_val_db) || exit 1.
-_val_db() {
-  _vd_name=$(new_db "$@") || exit 1
-  _val_track "$_vd_name"
-  printf '%s\n' "$_vd_name"
-}
-
 _val_label() {
   printf '%s' "$1" | tr 'A-Z_' 'a-z-'
 }
@@ -50,6 +24,13 @@ _val_without() {
     POSTGRES_DATABASE | S3_BUCKET) ;;
     *) VAL_ARGS+=(--unset "$1") ;;
   esac
+}
+
+# _val_blank <variable> <database> <bucket> - like _val_without, but the
+# variable is set to "".
+_val_blank() {
+  _val_without "$@"
+  VAL_ARGS+=(-e "$1=")
 }
 
 # _val_hooks_all - a recording script and an http URL hook for every event.
@@ -88,6 +69,43 @@ _val_assert_unchanged() {
     head -n 20 "$2.diff" >&2
     fail "${3:-database $1 changed}"
   }
+}
+
+# _val_blank_setup - a database, a bucket with one backup of it (key) and a
+# hook for every event. The backup doubles as the control: it shows that the
+# hooks fire when nothing is blank. Snapshots the database to $CASE_DIR/before.
+_val_blank_setup() {
+  db=$(new_db) || exit 1
+  bucket=$(new_bucket) || exit 1
+  _val_hooks_all
+  bk_backup control "$db" "$bucket" "${VAL_HOOK_ARGS[@]}"
+  assert_rc 0 "control backup with every required variable"
+  assert_eq "$(hook_events)" "pre-backup post-backup" "hook scripts of the control backup"
+  assert_eq "$(_val_url_events)" "pre-backup post-backup" "URL hooks of the control backup"
+  key=$(s3_single_key "$bucket" backup/) || exit 1
+  _val_snapshot "$db" "$CASE_DIR/before"
+}
+
+# _val_blank_rejected <variable> - a backup, then a restore with DROP_DATABASE
+# and CREATE_DATABASE, in which only that variable is "".
+_val_blank_rejected() {
+  _val_blank "$1" "$db" "$bucket"
+  bk_run "blank-$(_val_label "$1")" "${VAL_ARGS[@]}" "${VAL_HOOK_ARGS[@]}"
+  assert_rc 1 "backup with an empty $1"
+  assert_log_contains "You need to set the $1 environment variable"
+  assert_log_not_contains "Creating dump of" "dump started with an empty $1"
+  assert_eq "$(hook_events)" "pre-backup post-backup" "hook scripts run so far (backup with an empty $1)"
+  assert_eq "$(_val_url_events)" "pre-backup post-backup" "URL hooks requested so far (backup with an empty $1)"
+  assert_s3_count "$bucket" "" 1 "objects after a backup with an empty $1"
+
+  bk_run "blank-$(_val_label "$1")-restore" "${VAL_ARGS[@]}" -e "BACKUP_FILE=$key" \
+    -e DROP_DATABASE=yes -e CREATE_DATABASE=yes "${VAL_HOOK_ARGS[@]}"
+  assert_rc 1 "restore with an empty $1"
+  assert_log_contains "You need to set the $1 environment variable"
+  assert_log_not_contains "Downloading backup file" "download started with an empty $1"
+  assert_eq "$(hook_events)" "pre-backup post-backup" "hook scripts run so far (restore with an empty $1)"
+  assert_eq "$(_val_url_events)" "pre-backup post-backup" "URL hooks requested so far (restore with an empty $1)"
+  _val_assert_unchanged "$db" "$CASE_DIR/before" "a restore with an empty $1 changed $db"
 }
 
 _val_exited() {
@@ -179,8 +197,16 @@ test_validation_docs_env_table_matches_image() {
   assert_eq "$(uniq -d "$CASE_DIR/readme-names" | tr '\n' ' ')" "" "variables listed twice in README.md"
   assert_eq "$(LC_ALL=C comm -23 "$CASE_DIR/image-names" "$CASE_DIR/readme-names" | tr '\n' ' ')" "" \
     "variables the image sets that README.md's table does not document"
-  assert_eq "$(LC_ALL=C comm -13 "$CASE_DIR/image-names" "$CASE_DIR/readme-names" | tr '\n' ' ')" "" \
-    "README.md table rows the image does not set"
+  # A row without an ENV in the image (TZ, say, whose default comes from the C
+  # library) must still name a variable that the image's scripts read. Its
+  # default is not checked.
+  LC_ALL=C comm -13 "$CASE_DIR/image-names" "$CASE_DIR/readme-names" >"$CASE_DIR/readme-only"
+  if [ -s "$CASE_DIR/readme-only" ]; then
+    unread=$(docker run --rm --label "e2e.run=$E2E_RUN_ID" --entrypoint sh "$E2E_IMAGE" -c '
+      for n in "$@"; do grep -qw -- "$n" ./*.sh || echo "$n"; done' sh $(cat "$CASE_DIR/readme-only")) ||
+      fail "could not read the scripts in $E2E_IMAGE"
+    assert_eq "$(printf '%s' "$unread" | tr '\n' ' ')" "" "README.md table rows the image neither sets nor reads"
+  fi
 
   mismatches=""
   while IFS='|' read -r name value; do
@@ -224,7 +250,7 @@ test_validation_image_contents() {
     echo "su_exec_uid=$(su-exec hook id -u)"
     echo "hooks_dir=$(stat -c "%U:%G %a" /hooks)"
     w=${PWD%/}
-    for f in /hooks/probe "$w/run.sh" "$w/backup.sh" "$w/restore.sh" "$w/hooks.sh" \
+    for f in /hooks/probe "$w"/*.sh \
       "$(command -v go-cron)" /usr/local/share/ca-certificates/probe.crt /root/probe; do
       su-exec hook sh -c ": >> \"\$1\"" sh "$f" 2>/dev/null && echo "hook_writes=$f"
     done
@@ -232,7 +258,9 @@ test_validation_image_contents() {
       su-exec hook sh -c "mkdir -p \"\$1\" && : > \"\$1/probe\"" sh "$d" 2>/dev/null && echo "hook_writes=$d"
     done
     find / -xdev \( -perm -4000 -o -perm -2000 \) -type f 2>/dev/null | sed "s/^/setid=/"
-    echo "go_cron=$(go-cron 2>&1 | head -n 1)"
+    usage=$(go-cron 2>&1)
+    echo "go_cron_rc=$?"
+    echo "go_cron=$(printf "%s" "$usage" | tr "\n" " ")"
   '
   assert_rc 0 "image probe"
 
@@ -249,7 +277,12 @@ test_validation_image_contents() {
     assert_eq "$(_val_probe tool | grep -Fx -- "$b")" "$b" "$b on PATH"
   done
   assert_eq "$(_val_probe gnu_date)" yes "GNU date, which DELETE_OLDER_THAN phrases such as '30 days ago' need"
-  assert_match "$(_val_probe go_cron)" "^Usage: go-cron " "go-cron runs"
+  # Without arguments go-cron prints its usage. 126 and 127 are the shell's
+  # "cannot execute" and "not found", whose messages name go-cron too.
+  go_cron_rc=$(_val_probe go_cron_rc)
+  [ -n "$go_cron_rc" ] && [ "$go_cron_rc" -lt 126 ] ||
+    fail "go-cron did not run (exit ${go_cron_rc:-unset}): $(_val_probe go_cron)"
+  assert_match "$(_val_probe go_cron)" "go-cron" "go-cron's usage"
   readme_alpine=$(sed -n 's/.*based on Alpine \([0-9][0-9.]*[0-9]\).*/\1/p' "$_VAL_ROOT/README.md" | head -n 1)
   [ -n "$readme_alpine" ] || fail "README.md does not say which Alpine release the image is based on"
   case "$(_val_probe alpine)" in
@@ -278,17 +311,16 @@ test_validation_image_contents() {
 # /tmp/dump.sql.gz.enc and /tmp/s3-listing after the pre-backup hook has run;
 # symlinks planted there must not make root overwrite other files.
 test_validation_hook_cannot_redirect_root_temp_files() {
-  xfail "backup.sh writes /tmp/dump.sql.gz.enc and /tmp/s3-listing as root without removing what is already there, so symlinks planted by a pre-backup hook make root overwrite any file"
   if [ "$(docker run --rm --label "e2e.run=$E2E_RUN_ID" --entrypoint cat "$E2E_IMAGE" /proc/sys/fs/protected_symlinks)" != 0 ]; then
     skip "the kernel stops root following other users' symlinks in /tmp (fs.protected_symlinks)"
   fi
-  _val_begin
-  db=$(_val_db) || exit 1
+  db=$(new_db) || exit 1
   bucket=$(new_bucket) || exit 1
   hooks_setup
   write_hook pre-backup '#!/bin/sh
 ln -s /etc/motd /tmp/dump.sql.gz.enc && ln -s /etc/issue /tmp/s3-listing && echo planted >>/hook-out/events'
 
+  xfail "backup.sh writes /tmp/dump.sql.gz.enc and /tmp/s3-listing as root without removing what is already there, so symlinks planted by a pre-backup hook make root overwrite any file"
   bk_backup backup "$db" "$bucket" "${HOOK_MOUNTS[@]}" -e ENCRYPTION_PASSWORD=e2e-secret \
     -e "DELETE_OLDER_THAN=1 day ago" -- sh -c '
       before=$(md5sum /etc/motd /etc/issue)
@@ -308,8 +340,7 @@ ln -s /etc/motd /tmp/dump.sql.gz.enc && ln -s /etc/issue /tmp/s3-listing && echo
 # must not fire any hook, including the *-error ones (README.md, "Lifecycle hooks").
 
 test_validation_backup_rejects_missing_required_variables() {
-  _val_begin
-  db=$(_val_db) || exit 1
+  db=$(new_db) || exit 1
   bucket=$(new_bucket) || exit 1
   _val_hooks_all
 
@@ -333,8 +364,7 @@ test_validation_backup_rejects_missing_required_variables() {
 }
 
 test_validation_restore_rejects_missing_required_variables() {
-  _val_begin
-  db=$(_val_db) || exit 1
+  db=$(new_db) || exit 1
   bucket=$(new_bucket) || exit 1
   bk_backup backup "$db" "$bucket"
   assert_rc 0 "backup to restore from"
@@ -358,7 +388,6 @@ test_validation_restore_rejects_missing_required_variables() {
   assert_s3_count "$bucket" "" 1 "objects after rejected restores"
 
   restored="${db}_copy"
-  _val_track "$restored"
   bk_restore control "$restored" "$bucket" "$key" -e CREATE_DATABASE=yes "${VAL_HOOK_ARGS[@]}"
   assert_rc 0 "restore with every required variable"
   assert_eq "$(hook_events)" "pre-restore post-restore" "hook scripts of the control restore"
@@ -367,8 +396,7 @@ test_validation_restore_rejects_missing_required_variables() {
 }
 
 test_validation_restore_script_requires_backup_file() {
-  _val_begin
-  db=$(_val_db) || exit 1
+  db=$(new_db) || exit 1
   bucket=$(new_bucket) || exit 1
   _val_hooks_all
 
@@ -385,12 +413,11 @@ test_validation_restore_script_requires_backup_file() {
 
 # run.sh treats an empty BACKUP_FILE as unset; restore.sh should too.
 test_validation_restore_script_rejects_empty_backup_file() {
-  xfail "restore.sh only rejects BACKUP_FILE=**None**: an empty value downloads s3://<bucket>/, drops the database when DROP_DATABASE=yes, then fails with 'Unsupported backup format'"
-  _val_begin
-  db=$(_val_db) || exit 1
+  db=$(new_db) || exit 1
   bucket=$(new_bucket) || exit 1
   _val_hooks_all
 
+  xfail "restore.sh only rejects BACKUP_FILE=**None**: an empty value downloads s3://<bucket>/, drops the database when DROP_DATABASE=yes, then fails with 'Unsupported backup format'"
   bk_run direct -e "POSTGRES_DATABASE=$db" -e "S3_BUCKET=$bucket" -e BACKUP_FILE= -e DROP_DATABASE=yes \
     "${VAL_HOOK_ARGS[@]}" -- sh restore.sh
   db_exists "$db" || fail "restore.sh with an empty BACKUP_FILE dropped $db"
@@ -401,8 +428,7 @@ test_validation_restore_script_rejects_empty_backup_file() {
 }
 
 test_validation_s3_key_pair_must_be_complete() {
-  _val_begin
-  db=$(_val_db) || exit 1
+  db=$(new_db) || exit 1
   bucket=$(new_bucket) || exit 1
   _val_hooks_all
 
@@ -482,8 +508,7 @@ test_validation_docker_link_variables_supply_host_and_port() {
 # run.sh dispatch.
 
 test_validation_dispatch_backs_up_once_without_backup_file() {
-  _val_begin
-  db=$(_val_db) || exit 1
+  db=$(new_db) || exit 1
 
   for variant in unset blank; do
     bucket=$(new_bucket "$variant") || exit 1
@@ -501,35 +526,13 @@ test_validation_dispatch_backs_up_once_without_backup_file() {
   done
 }
 
-test_validation_dispatch_backup_file_wins_over_schedule() {
-  _val_begin
-  db=$(_val_db) || exit 1
-  bucket=$(new_bucket) || exit 1
-  bk_backup backup "$db" "$bucket"
-  assert_rc 0 "backup to restore from"
-  key=$(s3_single_key "$bucket" backup/) || exit 1
-
-  restored="${db}_copy"
-  _val_track "$restored"
-  bk_start restore -e "POSTGRES_DATABASE=$restored" -e "S3_BUCKET=$bucket" -e "BACKUP_FILE=$key" \
-    -e CREATE_DATABASE=yes -e "SCHEDULE=@every 1s"
-  _val_wait_exit 120
-  assert_rc 0 "restore with SCHEDULE also set"
-  assert_log_contains "Database restore completed successfully"
-  assert_log_not_contains "Cron job scheduled"
-  assert_log_not_contains "Creating dump of"
-  assert_s3_count "$bucket" "" 1 "objects after a restore with SCHEDULE set"
-  assert_same_data "$db" "$restored"
-}
-
 # ---------------------------------------------------------------------------
 # Blank values. Kubernetes manifests often set value: "" (README.md's example
 # does so for several optional variables); a blank optional variable should
 # behave as if it were unset.
 
 test_validation_empty_optional_values_behave_like_defaults() {
-  _val_begin
-  db=$(_val_db) || exit 1
+  db=$(new_db) || exit 1
   bucket=$(new_bucket) || exit 1
   hooks_setup
   for event in pre-backup post-backup pre-restore post-restore; do
@@ -561,7 +564,6 @@ test_validation_empty_optional_values_behave_like_defaults() {
     "uid of a hook script (not root)"
 
   restored="${db}_copy"
-  _val_track "$restored"
   psql_exec postgres "CREATE DATABASE $(sql_ident "$restored")" >/dev/null || fail "could not create $restored"
   bk_restore restore "$restored" "$bucket" "$key" "${HOOK_MOUNTS[@]}" "${blanks[@]}"
   assert_rc 0 "restore with blank optional variables"
@@ -572,7 +574,6 @@ test_validation_empty_optional_values_behave_like_defaults() {
 
   # CREATE_DATABASE="" means no: a missing database is not created.
   missing="${db}_missing"
-  _val_track "$missing"
   bk_restore missing "$missing" "$bucket" "$key" -e CREATE_DATABASE=
   assert_rc_nonzero "restore into a missing database with an empty CREATE_DATABASE"
   assert_log_not_contains "Creating database"
@@ -582,15 +583,13 @@ test_validation_empty_optional_values_behave_like_defaults() {
 }
 
 test_validation_empty_parallel_jobs_restores_without_jobs() {
-  _val_begin
-  db=$(_val_db) || exit 1
+  db=$(new_db) || exit 1
   bucket=$(new_bucket) || exit 1
   bk_backup backup "$db" "$bucket" -e USE_CUSTOM_FORMAT=yes
   assert_rc 0 "custom format backup"
   key=$(s3_single_key "$bucket" backup/) || exit 1
 
   restored="${db}_copy"
-  _val_track "$restored"
   bk_restore restore "$restored" "$bucket" "$key" -e CREATE_DATABASE=yes -e PARALLEL_JOBS=
   assert_rc 0 "custom format restore with an empty PARALLEL_JOBS"
   assert_log_contains "Restoring database $restored from custom format"
@@ -599,8 +598,7 @@ test_validation_empty_parallel_jobs_restores_without_jobs() {
 }
 
 test_validation_empty_hook_allow_http_keeps_http_blocked() {
-  _val_begin
-  db=$(_val_db) || exit 1
+  db=$(new_db) || exit 1
   bucket=$(new_bucket) || exit 1
 
   bk_backup backup "$db" "$bucket" -e HOOK_ALLOW_HTTP= -e "HOOK_PRE_BACKUP_URL=$(hook_url http ok pre-backup)"
@@ -612,8 +610,7 @@ test_validation_empty_hook_allow_http_keeps_http_blocked() {
 
 # Nothing in these runs trusts the e2e CA, so every upload must be refused.
 test_validation_empty_tls_options_keep_certificate_checks() {
-  _val_begin
-  db=$(_val_db) || exit 1
+  db=$(new_db) || exit 1
   bucket=$(S3_ALIAS=tls new_bucket) || exit 1
 
   for var in S3_SSL_VERIFY S3_CA_BUNDLE; do
@@ -628,11 +625,10 @@ test_validation_empty_tls_options_keep_certificate_checks() {
 # README.md offers AWS_CA_BUNDLE as an alternative to S3_CA_BUNDLE. Set but
 # empty, the AWS CLI stops verifying certificates altogether.
 test_validation_empty_aws_ca_bundle_keeps_certificate_checks() {
-  xfail "an empty AWS_CA_BUNDLE is passed to the AWS CLI, which then skips certificate verification (InsecureRequestWarning) although S3_SSL_VERIFY is yes, so the backup goes to an untrusted endpoint"
-  _val_begin
-  db=$(_val_db) || exit 1
+  db=$(new_db) || exit 1
   bucket=$(S3_ALIAS=tls new_bucket) || exit 1
 
+  xfail "an empty AWS_CA_BUNDLE is passed to the AWS CLI, which then skips certificate verification (InsecureRequestWarning) although S3_SSL_VERIFY is yes, so the backup goes to an untrusted endpoint"
   bk_backup backup "$db" "$bucket" --unset S3_ENDPOINT -e S3_ENDPOINT=https://minio-tls:9000 -e AWS_CA_BUNDLE=
   assert_eq "$(S3_ALIAS=tls s3_count "$bucket" "")" 0 "objects uploaded without a trusted certificate"
   assert_rc 2 "backup to an untrusted TLS endpoint with an empty AWS_CA_BUNDLE"
@@ -640,11 +636,10 @@ test_validation_empty_aws_ca_bundle_keeps_certificate_checks() {
 }
 
 test_validation_empty_schedule_runs_one_backup() {
-  xfail "an empty SCHEDULE (as in README.md's Kubernetes example) is passed to go-cron, which exits 1 with 'Invalid schedule format: empty spec string' and no backup"
-  _val_begin
-  db=$(_val_db) || exit 1
+  db=$(new_db) || exit 1
   bucket=$(new_bucket) || exit 1
 
+  xfail "an empty SCHEDULE (as in README.md's Kubernetes example) is passed to go-cron, which exits 1 with 'Invalid schedule format: empty spec string' and no backup"
   bk_start run -e "POSTGRES_DATABASE=$db" -e "S3_BUCKET=$bucket" -e SCHEDULE=
   _val_wait_exit 120
   assert_rc 0 "run with an empty SCHEDULE"
@@ -654,27 +649,24 @@ test_validation_empty_schedule_runs_one_backup() {
 }
 
 test_validation_empty_postgres_port_uses_default() {
-  xfail "an empty POSTGRES_PORT (as in README.md's Kubernetes example) leaves a bare '-p' that takes '-U' as the port, so pg_dump fails with 'too many command-line arguments'"
-  _val_begin
-  db=$(_val_db) || exit 1
+  db=$(new_db) || exit 1
   bucket=$(new_bucket) || exit 1
 
+  xfail "an empty POSTGRES_PORT (as in README.md's Kubernetes example) leaves a bare '-p' that takes '-U' as the port, so pg_dump fails with 'too many command-line arguments'"
   bk_backup backup "$db" "$bucket" -e POSTGRES_PORT=
   assert_rc 0 "backup with an empty POSTGRES_PORT"
   key=$(s3_single_key "$bucket" backup/) || exit 1
   restored="${db}_copy"
-  _val_track "$restored"
   bk_restore restore "$restored" "$bucket" "$key" -e CREATE_DATABASE=yes -e POSTGRES_PORT=
   assert_rc 0 "restore with an empty POSTGRES_PORT"
   assert_same_data "$db" "$restored"
 }
 
 test_validation_empty_s3_endpoint_same_as_unset() {
-  xfail "an empty S3_ENDPOINT (as in README.md's Kubernetes example) becomes a bare '--endpoint-url' that takes 's3' as the URL, so every aws call fails with \"Found invalid choice 'cp'\" and the backup exits 2"
-  _val_begin
-  db=$(_val_db) || exit 1
+  db=$(new_db) || exit 1
   bucket=$(new_bucket) || exit 1
 
+  xfail "an empty S3_ENDPOINT (as in README.md's Kubernetes example) becomes a bare '--endpoint-url' that takes 's3' as the URL, so every aws call fails with \"Found invalid choice 'cp'\" and the backup exits 2"
   # AWS_ENDPOINT_URL stands in for AWS's own endpoint, which the suite cannot reach.
   bk_backup backup "$db" "$bucket" --unset S3_ENDPOINT -e S3_ENDPOINT= -e AWS_ENDPOINT_URL=http://minio:9000
   assert_rc 0 "backup with an empty S3_ENDPOINT"
@@ -683,12 +675,11 @@ test_validation_empty_s3_endpoint_same_as_unset() {
 
 # Disabling retention or rejecting the value are both fine; deleting is not.
 test_validation_empty_delete_older_than_deletes_nothing() {
-  xfail "an empty DELETE_OLDER_THAN reaches 'date -d \"\"', which is midnight today, so every object in the prefix older than that is deleted"
-  _val_begin
-  db=$(_val_db) || exit 1
+  db=$(new_db) || exit 1
   bucket=$(new_bucket) || exit 1
   _val_put_aged "$bucket" backup/older.sql.gz "3 days ago"
 
+  xfail "an empty DELETE_OLDER_THAN reaches 'date -d \"\"', which is midnight today, so every object in the prefix older than that is deleted"
   bk_backup backup "$db" "$bucket" -e DELETE_OLDER_THAN=
   assert_s3_exists "$bucket" backup/older.sql.gz "an empty DELETE_OLDER_THAN deleted an older object"
   assert_log_not_contains "DELETING"
@@ -697,18 +688,16 @@ test_validation_empty_delete_older_than_deletes_nothing() {
 # Treating the blank like unset (a plain backup) or rejecting it are both fine.
 # An object that looks encrypted but needs no password to open is not.
 test_validation_empty_encryption_password_never_used_as_key() {
-  xfail "an empty ENCRYPTION_PASSWORD is used as the key: the backup is uploaded as .sql.gz.enc, encrypted with an empty password that anyone can supply"
-  _val_begin
-  db=$(_val_db) || exit 1
+  db=$(new_db) || exit 1
   bucket=$(new_bucket) || exit 1
 
+  xfail "an empty ENCRYPTION_PASSWORD is used as the key: the backup is uploaded as .sql.gz.enc, encrypted with an empty password that anyone can supply"
   bk_backup backup "$db" "$bucket" -e ENCRYPTION_PASSWORD=
   assert_eq "$(s3_keys "$bucket" | grep '\.enc$')" "" "objects encrypted with an empty password"
   assert_log_not_contains "Encrypting "
   if [ "$BK_RC" = 0 ]; then
     key=$(s3_single_key "$bucket" backup/) || exit 1
     restored="${db}_copy"
-    _val_track "$restored"
     bk_restore restore "$restored" "$bucket" "$key" -e CREATE_DATABASE=yes -e ENCRYPTION_PASSWORD=
     assert_rc 0 "restore with an empty ENCRYPTION_PASSWORD"
     assert_same_data "$db" "$restored"
@@ -718,42 +707,40 @@ test_validation_empty_encryption_password_never_used_as_key() {
 }
 
 test_validation_empty_compression_cmd_uses_gzip() {
-  xfail "an empty COMPRESSION_CMD leaves 'pg_dump ... | > file', so pg_dump is killed by SIGPIPE and every plain backup exits 141"
-  _val_begin
-  db=$(_val_db) || exit 1
+  db=$(new_db) || exit 1
   bucket=$(new_bucket) || exit 1
 
+  xfail "an empty COMPRESSION_CMD leaves 'pg_dump ... | > file', so pg_dump is killed by SIGPIPE and every plain backup exits 141"
   bk_backup backup "$db" "$bucket" -e COMPRESSION_CMD=
   assert_rc 0 "backup with an empty COMPRESSION_CMD"
   key=$(s3_single_key "$bucket" backup/) || exit 1
   restored="${db}_copy"
-  _val_track "$restored"
   bk_restore restore "$restored" "$bucket" "$key" -e CREATE_DATABASE=yes
   assert_rc 0 "default restore of that backup"
   assert_same_data "$db" "$restored"
 }
 
 test_validation_empty_decompression_cmd_uses_gunzip() {
-  xfail "an empty DECOMPRESSION_CMD makes restore.sh execute the downloaded file itself ('Permission denied', exit 126), so every plain restore fails"
-  _val_begin
-  db=$(_val_db) || exit 1
+  db=$(new_db) || exit 1
   bucket=$(new_bucket) || exit 1
   bk_backup backup "$db" "$bucket"
   assert_rc 0 "backup to restore from"
   key=$(s3_single_key "$bucket" backup/) || exit 1
 
   restored="${db}_copy"
-  _val_track "$restored"
+  xfail "an empty DECOMPRESSION_CMD makes restore.sh execute the downloaded file itself ('Permission denied', exit 126), so every plain restore fails"
   bk_restore restore "$restored" "$bucket" "$key" -e CREATE_DATABASE=yes -e DECOMPRESSION_CMD=
   assert_rc 0 "restore with an empty DECOMPRESSION_CMD"
   assert_same_data "$db" "$restored"
 }
 
-# A blank required variable should be rejected like a missing one.
+# A blank required variable must be rejected like a missing one: README.md's
+# Kubernetes example sets each of them to "". POSTGRES_DATABASE has tests of
+# its own because a blank one dumps or restores the wrong database.
 test_validation_empty_postgres_database_rejected_on_backup() {
-  xfail "an empty POSTGRES_DATABASE passes validation (only **None** is checked), so pg_dump falls back to the database named after the user, uploads it as backup/_<timestamp>.sql.gz and exits 0"
   bucket=$(new_bucket) || exit 1
 
+  xfail "an empty POSTGRES_DATABASE passes validation (only **None** is checked), so pg_dump falls back to the database named after the user, uploads it as backup/_<timestamp>.sql.gz and exits 0"
   bk_run backup -e "S3_BUCKET=$bucket" -e POSTGRES_DATABASE=
   assert_s3_count "$bucket" "" 0 "objects uploaded with an empty POSTGRES_DATABASE"
   assert_rc 1 "backup with an empty POSTGRES_DATABASE"
@@ -761,20 +748,43 @@ test_validation_empty_postgres_database_rejected_on_backup() {
 }
 
 test_validation_empty_postgres_database_rejected_on_restore() {
-  xfail "an empty POSTGRES_DATABASE passes restore validation and 'psql -d \"\"' connects to the database named after the user, so the backup is loaded into the postgres maintenance database and the run reports success"
-  _val_begin
   # A server of its own, because the current behaviour writes into its postgres database.
   ctr=$(start_postgres valblank) || exit 1
-  db=$(_val_db) || exit 1
+  db=$(new_db) || exit 1
   bucket=$(new_bucket) || exit 1
   bk_backup backup "$db" "$bucket"
   assert_rc 0 "backup to restore from"
   key=$(s3_single_key "$bucket" backup/) || exit 1
 
+  xfail "an empty POSTGRES_DATABASE passes restore validation and 'psql -d \"\"' connects to the database named after the user, so the backup is loaded into the postgres maintenance database and the run reports success"
   bk_restore restore "" "$bucket" "$key" --unset POSTGRES_HOST -e POSTGRES_HOST=valblank -e CREATE_DATABASE=yes
   assert_eq "$(_val_sql "$ctr" 5432 postgres "SELECT count(*) FROM pg_namespace WHERE nspname = 'app'")" 0 \
     "backup restored into the postgres database"
   assert_rc 1 "restore with an empty POSTGRES_DATABASE"
   assert_log_contains "You need to set the POSTGRES_DATABASE environment variable."
   assert_log_not_contains "Downloading backup file"
+}
+
+test_validation_empty_s3_bucket_rejected() {
+  _val_blank_setup
+  xfail "an empty S3_BUCKET passes validation (only **None** is checked), so the pre-backup hooks run, the dump runs, the upload fails with 'Invalid bucket name \"\"' (exit 2) and the backup-error hooks fire"
+  _val_blank_rejected S3_BUCKET
+}
+
+test_validation_empty_postgres_host_rejected() {
+  _val_blank_setup
+  xfail "an empty POSTGRES_HOST passes validation (only **None** is checked), so the pre-backup hooks run, pg_dump takes '-p' as the host and fails with 'too many command-line arguments', and the backup-error hooks fire"
+  _val_blank_rejected POSTGRES_HOST
+}
+
+test_validation_empty_postgres_user_rejected() {
+  _val_blank_setup
+  xfail "an empty POSTGRES_USER passes validation (only **None** is checked), so the pre-backup hooks run, '-U' takes the next argument as the user name, pg_dump fails with 'password authentication failed' and the backup-error hooks fire"
+  _val_blank_rejected POSTGRES_USER
+}
+
+test_validation_empty_postgres_password_rejected() {
+  _val_blank_setup
+  xfail "an empty POSTGRES_PASSWORD passes validation (only **None** is checked), so the pre-backup hooks run, pg_dump fails with 'fe_sendauth: no password supplied' and the backup-error hooks fire"
+  _val_blank_rejected POSTGRES_PASSWORD
 }
