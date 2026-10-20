@@ -1,7 +1,9 @@
 """Receiver for URL hooks in the end-to-end suite.
 
 Serves HTTP on 8080 and HTTPS on 8443 and appends one line per request to
-LOG_FILE: "<scheme> <method> <path>". The first path segment picks the reply:
+LOG_FILE: "<scheme> <method> <path>", and one JSON object per request with its
+path and headers to headers.log next to it. The first path segment picks the
+reply:
 
   /ok/...        200
   /fail/...      403 (curl does not retry it)
@@ -10,19 +12,25 @@ LOG_FILE: "<scheme> <method> <path>". The first path segment picks the reply:
 """
 
 import http.server
+import json
+import os
 import ssl
 import sys
 import threading
 
 LOG_FILE, CERT_FILE, KEY_FILE, READY_FILE = sys.argv[1:5]
+HEADERS_FILE = os.path.join(os.path.dirname(LOG_FILE), "headers.log")
 LOCK = threading.Lock()
 
 
 class Handler(http.server.BaseHTTPRequestHandler):
     def handle_any(self):
         scheme = "https" if self.server.server_port == 8443 else "http"
-        with LOCK, open(LOG_FILE, "a", encoding="utf-8") as log:
-            log.write(f"{scheme} {self.command} {self.path}\n")
+        with LOCK:
+            with open(LOG_FILE, "a", encoding="utf-8") as log:
+                log.write(f"{scheme} {self.command} {self.path}\n")
+            with open(HEADERS_FILE, "a", encoding="utf-8") as log:
+                log.write(json.dumps({"path": self.path, "headers": dict(self.headers.items())}) + "\n")
 
         kind = self.path.split("/")[1] if self.path.count("/") >= 1 else ""
         if kind == "fail":

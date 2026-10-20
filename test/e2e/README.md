@@ -29,7 +29,7 @@ E2E_BUILD=0 E2E_IMAGE=postgres-backup-s3:e2e E2E_CASES="backup.sh restore.sh" te
 E2E_LIST=1 test/e2e/run.sh
 ```
 
-Each run uses its own network and container names, so two runs can share one Docker daemon. Everything is removed afterwards. `E2E_KEEP=1` keeps it for debugging, and `E2E_VERBOSE=1` prints the output of passing tests too. The header of `run.sh` lists every setting, including how to test against another PostgreSQL server version (`E2E_POSTGRES_IMAGE`).
+Each run uses its own network and container names, so two runs can share one Docker daemon. Everything is removed afterwards, including each case's databases as soon as the case ends. `E2E_KEEP=1` keeps it all for debugging; remove it afterwards with `docker rm -f -v $(docker ps -aq --filter label=e2e.run=<id>)` (the `-v` also removes PostgreSQL's data volumes) and `docker network rm <id>-net`. `E2E_VERBOSE=1` prints the output of passing tests too. The header of `run.sh` lists every setting, including how to test against another PostgreSQL server version (`E2E_POSTGRES_IMAGE`).
 
 The output has one line per test: `ok`, `FAIL`, `xfail` (a known product bug, see below), `XPASS` or `skip`. The run fails on any `FAIL` or `XPASS`. A failing test prints its own output and the tail of the container log.
 
@@ -63,8 +63,9 @@ test_restore_custom_format_parallel() {
 - Each test runs in its own subshell and gets its own database and bucket. Don't rely on other tests or on their order.
 - `bk_run` and its wrappers start from a working configuration (`E2E_BASE_ENV` in `lib.sh`). Add `-e NAME=value` to override a variable, and `--unset NAME` to leave it at the image default.
 - Assert what a user would see: the exit code, the log, the objects in S3 and the data in PostgreSQL.
+- Assert outcomes rather than implementation details: check S3 contents, exit codes and data, and match only the parts of log lines that a user would rely on. A temporary file path or the exact wording of an internal message should not decide whether a test passes.
 - Poll with `wait_for` rather than sleeping a fixed time.
 
 ## Known bugs
 
-If a test exposes a product bug that is not fixed yet, write the test for the correct behaviour and start it with `xfail "short reason"`. The run reports it as `xfail` and stays green. Once the bug is fixed, the test passes and the run fails with `XPASS` until the marker is removed.
+If a test exposes a product bug that is not fixed yet, write the test for the correct behaviour and call `xfail "short reason"` just before the step that exposes the bug, after the setup. The run reports it as `xfail` and stays green, while a failure during setup still shows as `FAIL`. Once the bug is fixed, the test passes and the run fails with `XPASS` until the marker is removed.

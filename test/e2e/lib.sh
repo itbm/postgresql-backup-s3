@@ -29,7 +29,9 @@ E2E_BASE_ENV=(
 # Outcome markers and assertions. An assertion failure ends the case.
 
 # Marks the case as expected to fail (a known bug). If it passes, the run fails
-# with XPASS so the marker gets removed once the bug is fixed.
+# with XPASS so the marker gets removed once the bug is fixed. Call it just
+# before the step that exposes the bug, after the setup: a failure before the
+# call is then reported as FAIL rather than hidden as an expected failure.
 xfail() {
   printf '%s\n' "$*" > "$CASE_DIR/.xfail"
 }
@@ -298,9 +300,19 @@ sql_ident() {
   printf '"%s"' "$(printf '%s' "$1" | sed 's/"/""/g')"
 }
 
-# psql_exec <database> <sql> - prints unaligned, tuples-only output.
+# psql_exec <database> <sql> - prints unaligned, tuples-only output. Reads
+# nothing from stdin, so it is safe inside `while read` loops.
 psql_exec() {
-  docker exec -i "${PG_CTR:-$E2E_PG_CTR}" psql -X -q -U postgres -d "$1" -At -v ON_ERROR_STOP=1 -c "$2"
+  docker exec -i "${PG_CTR:-$E2E_PG_CTR}" psql -X -q -U postgres -d "$1" -At -v ON_ERROR_STOP=1 -c "$2" </dev/null
+}
+
+# When a case ends, run.sh drops the databases on the shared server whose
+# names start with the case's new_db prefix (t_<slug>), plus any listed in
+# CASE_DIR/.dbs, so disk use does not grow with every case.
+_record_db() {
+  if [ "${PG_CTR:-$E2E_PG_CTR}" = "$E2E_PG_CTR" ]; then
+    printf '%s\n' "$1" >>"$CASE_DIR/.dbs"
+  fi
 }
 
 db_exists() {
@@ -319,6 +331,7 @@ new_db() {
 new_db_named() {
   psql_exec postgres "CREATE DATABASE $(sql_ident "$1") TEMPLATE e2e_seed" >/dev/null \
     || fail "could not create database $1"
+  _record_db "$1"
 }
 
 drop_db() {
@@ -408,6 +421,12 @@ hook_url() {
 # "<scheme> <method> <path>".
 hook_requests() {
   grep -F "/$CASE_SLUG/" "$E2E_WORK/hook-server/requests.log" 2>/dev/null || true
+}
+
+# hook_request_headers - one JSON object per request the receiver logged for
+# this case: {"path": "...", "headers": {"Name": "value", ...}}.
+hook_request_headers() {
+  grep -F "/$CASE_SLUG/" "$E2E_WORK/hook-server/headers.log" 2>/dev/null || true
 }
 
 # Mount that makes the image trust the e2e CA through run.sh's

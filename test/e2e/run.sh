@@ -205,6 +205,19 @@ log "e2e: running ${#tests[@]} test(s)"
 # ---------------------------------------------------------------------------
 # Execution.
 
+# drop_case_databases <slug> <case-dir> - see _record_db in lib.sh.
+drop_case_databases() {
+  [ "$E2E_KEEP" = 1 ] && return 0
+  _prefix=$(printf 't_%s' "$1" | tr '-' '_' | cut -c1-63)
+  {
+    psql_exec postgres "SELECT datname FROM pg_database
+      WHERE left(datname, length('$_prefix')) = '$_prefix'" 2>/dev/null
+    [ -f "$2/.dbs" ] && cat "$2/.dbs"
+  } | sort -u | while IFS= read -r _db; do
+    [ -n "$_db" ] && psql_exec postgres "DROP DATABASE IF EXISTS $(sql_ident "$_db") WITH (FORCE)" >/dev/null 2>&1
+  done
+}
+
 passed=0
 failed=0
 xfailed=0
@@ -230,6 +243,7 @@ for t in "${tests[@]}"; do
 
   ids=$(docker ps -aq --filter "label=e2e.case=$slug" --filter "label=e2e.run=$E2E_RUN_ID")
   [ -z "$ids" ] || docker rm -f -v $ids >/dev/null 2>&1
+  drop_case_databases "$slug" "$dir"
 
   took="$((SECONDS - case_start))s"
   show=0
