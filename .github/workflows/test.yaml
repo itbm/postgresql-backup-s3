@@ -83,4 +83,7 @@ jobs:
           E2E_RESULT: ${{ needs.e2e.result }}
         run: |
           echo "list: $LIST_RESULT, e2e: $E2E_RESULT"
+          if [ "$LIST_RESULT" = cancelled ] || [ "$E2E_RESULT" = cancelled ]; then
+            echo "::error::End-to-end jobs were cancelled (usually by a newer push), so this run proves nothing."
+          fi
           [ "$LIST_RESULT" = success ] && [ "$E2E_RESULT" = success ]

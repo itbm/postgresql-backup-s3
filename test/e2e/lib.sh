@@ -51,6 +51,13 @@ show_last_log() {
 
 fail() {
   printf 'ASSERTION FAILED: %s\n' "$*" >&2
+  # Inside $(...) the exit only ends that subshell, so also record the
+  # failure for run.sh. One recorded before xfail is called is a setup
+  # failure and is reported as FAIL even if the case later calls xfail.
+  if [ -n "${CASE_DIR:-}" ]; then
+    printf '%s\n' "$*" >>"$CASE_DIR/.failed"
+    [ -f "$CASE_DIR/.xfail" ] || printf '%s\n' "$*" >>"$CASE_DIR/.failed_before_xfail"
+  fi
   show_last_log
   exit 1
 }

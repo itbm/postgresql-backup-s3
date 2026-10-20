@@ -247,7 +247,15 @@ for t in "${tests[@]}"; do
 
   took="$((SECONDS - case_start))s"
   show=0
-  if [ -f "$dir/.skip" ]; then
+  # fail() inside $(...) cannot end the case, but it leaves a record.
+  [ -f "$dir/.failed" ] && rc=1
+  if [ -f "$dir/.failed_before_xfail" ] && [ -f "$dir/.xfail" ]; then
+    result="FAIL"
+    failed=$((failed + 1))
+    failures+=("$t (failed before reaching its xfail step)")
+    detail=" - setup failed before the known-bug step"
+    show=1
+  elif [ -f "$dir/.skip" ]; then
     result="skip"
     skipped=$((skipped + 1))
     detail=" ($(cat "$dir/.skip"))"

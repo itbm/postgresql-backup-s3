@@ -61,6 +61,7 @@ test_restore_custom_format_parallel() {
 ```
 
 - Each test runs in its own subshell and gets its own database and bucket. Don't rely on other tests or on their order.
+- A helper that fails inside `$(...)`, such as `db=$(new_db)`, cannot stop the test, but the failure is recorded and the test is still reported as `FAIL`. Add `|| exit 1` where carrying on would only produce confusing follow-on errors.
 - `bk_run` and its wrappers start from a working configuration (`E2E_BASE_ENV` in `lib.sh`). Add `-e NAME=value` to override a variable, and `--unset NAME` to leave it at the image default.
 - Assert what a user would see: the exit code, the log, the objects in S3 and the data in PostgreSQL.
 - Assert outcomes rather than implementation details: check S3 contents, exit codes and data, and match only the parts of log lines that a user would rely on. A temporary file path or the exact wording of an internal message should not decide whether a test passes.
