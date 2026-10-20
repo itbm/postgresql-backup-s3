@@ -1,16 +1,38 @@
-FROM alpine:3.24 AS build
+# GOCRON_VARIANT selects the go-cron build: "default", or "otel" for the
+# OpenTelemetry image published as <version>-otel.
+ARG GOCRON_VARIANT=default
 
-WORKDIR /app
+# go-cron is cross-compiled on the build machine's platform, so arm64 images
+# do not compile under emulation.
+FROM --platform=$BUILDPLATFORM alpine:3.24 AS build
+
+WORKDIR /src
 
 RUN apk update \
 	&& apk upgrade \
 	&& apk add go
 
-COPY go.mod go.sum main.go /app/
-COPY internal /app/internal
+COPY go.mod go.sum ./
+RUN go mod download
+COPY main.go ./
+COPY internal ./internal
 
-RUN go mod download \
-	&& CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o out/go-cron .
+FROM build AS gocron-default
+ARG TARGETOS
+ARG TARGETARCH
+RUN CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH go build -trimpath -ldflags="-s -w" -o /out/go-cron .
+
+FROM build AS gocron-otel
+COPY otel/go.mod otel/go.sum ./otel/
+RUN cd otel && go mod download
+COPY otel ./otel
+ARG TARGETOS
+ARG TARGETARCH
+ARG VERSION=dev
+RUN cd otel \
+	&& CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH go build -trimpath -ldflags="-s -w -X main.version=$VERSION" -o /out/go-cron .
+
+FROM gocron-${GOCRON_VARIANT} AS gocron
 
 FROM alpine:3.24
 LABEL maintainer="ITBM"
@@ -24,7 +46,7 @@ RUN apk update \
 	&& chmod 755 /hooks \
 	&& rm -rf /var/cache/apk/*
 
-COPY --from=build /app/out/go-cron /usr/local/bin/go-cron
+COPY --from=gocron /out/go-cron /usr/local/bin/go-cron
 
 ENV POSTGRES_DATABASE=**None** \
 	POSTGRES_HOST=**None** \

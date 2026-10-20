@@ -29,16 +29,26 @@ jobs:
         run: sh test/hooks_test.sh
 
   go:
-    name: go-cron
+    name: go-cron (${{ matrix.module == '.' && 'default' || matrix.module }})
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # "." is the default go-cron; "otel" is the nested module for the -otel image.
+        module: [., otel]
+    defaults:
+      run:
+        working-directory: ${{ matrix.module }}
     steps:
       - name: Check out the repo
         uses: actions/checkout@v5
 
+      # Match the Go release that Alpine ships for the image build.
       - name: Set up Go
         uses: actions/setup-go@v6
         with:
-          go-version: stable
+          go-version: 1.26.x
+          cache-dependency-path: ${{ matrix.module }}/go.sum
 
       - name: Check formatting
         run: test -z "$(gofmt -l .)"
@@ -49,9 +59,16 @@ jobs:
       - name: Test
         run: go test -race ./...
 
+      - name: Check for known vulnerabilities
+        run: go run golang.org/x/vuln/cmd/govulncheck@v1.9.0 ./...
+
   docker:
-    name: Docker image
+    name: Docker image (${{ matrix.variant }})
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        variant: [default, otel]
     steps:
       - name: Check out the repo
         uses: actions/checkout@v5
@@ -65,6 +82,8 @@ jobs:
           context: .
           load: true
           tags: postgresql-backup-s3:ci
+          build-args: |
+            GOCRON_VARIANT=${{ matrix.variant }}
 
       - name: Run tests inside the image (BusyBox sh)
         run: docker run --rm -v "$PWD:/src:ro" -e SCRIPT_SHELL=sh postgresql-backup-s3:ci sh /src/test/hooks_test.sh
@@ -74,3 +93,41 @@ jobs:
           out=$(docker run --rm postgresql-backup-s3:ci go-cron 'not a schedule' /bin/true 2>&1 || true)
           echo "$out"
           echo "$out" | grep -q 'Invalid schedule format'
+
+      - name: Check the default go-cron has no OpenTelemetry code
+        if: matrix.variant == 'default'
+        run: |
+          docker run --rm postgresql-backup-s3:ci cat /usr/local/bin/go-cron > "$RUNNER_TEMP/go-cron"
+          go version -m "$RUNNER_TEMP/go-cron"
+          if go version -m "$RUNNER_TEMP/go-cron" | grep -q 'go.opentelemetry.io'; then
+            echo "The default image must not include the OpenTelemetry SDK."
+            exit 1
+          fi
+
+      # Port 1 is closed, so every export fails. go-cron must still exit 0 promptly.
+      - name: Check go-cron with an unreachable OTLP endpoint
+        if: matrix.variant == 'otel'
+        run: |
+          out=$(timeout 10 docker run --rm -e OTEL_EXPORTER_OTLP_ENDPOINT=http://127.0.0.1:1 postgresql-backup-s3:ci go-cron --once /bin/true 2>&1)
+          echo "$out"
+          echo "$out" | grep -q 'trace_id='
+
+  examples:
+    name: Monitoring examples
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out the repo
+        uses: actions/checkout@v5
+
+      - name: Test the Prometheus alert rules
+        run: docker run --rm -v "$PWD/examples:/examples:ro" -w /examples --entrypoint promtool prom/prometheus:v3.15.0 test rules prometheus-alerts.test.yaml
+
+      - name: Validate the Collector configurations
+        run: |
+          for config in otel-collector-logs.yaml otel-collector-otlp.yaml; do
+            echo "Validating $config"
+            docker run --rm -v "$PWD/examples:/examples:ro" otel/opentelemetry-collector-contrib:0.162.0 validate --config="/examples/$config"
+          done
+
+      - name: Validate the Docker Compose file
+        run: docker compose -f examples/docker-compose.otel.yaml config -q

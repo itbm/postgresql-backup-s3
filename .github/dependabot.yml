@@ -13,6 +13,16 @@ updates:
     directory: "/"
     schedule:
       interval: "weekly"
+  # The OpenTelemetry go-cron for the -otel image. The OpenTelemetry modules are
+  # released together, so update them in one pull request.
+  - package-ecosystem: "gomod"
+    directory: "/otel"
+    schedule:
+      interval: "weekly"
+    groups:
+      opentelemetry:
+        patterns:
+          - "go.opentelemetry.io/*"
   - package-ecosystem: "github-actions"
     directory: "/"
     schedule:
