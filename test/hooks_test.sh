@@ -1111,6 +1111,31 @@ assert_eq "$?" "143" "backup exit code when stopped"
 assert_eq "$(result_line)" "pgbackup-result operation=backup outcome=cancelled exit_code=143 database=appdb duration_s=D pre_backup_s=D dump_s=D backup_error_s=D failed_phase=dump" "backup result line when stopped"
 assert_eq "$(report_records "$REPORT")" "begin pre-backup T|end pre-backup T 0|begin dump T|set dump.format plain|set compression gzip|end dump T 143|begin backup-error T|end backup-error T 0|" "report records when stopped"
 
+# A stop signal during the error hooks must not cut the EXIT trap short:
+# the exit code and result line stay, and the error-hook phase records it.
+TERM_HOOKS="$WORKDIR/hooks-term"
+mkdir -p "$TERM_HOOKS"
+for _ev in backup-error restore-error; do
+  printf '#! /bin/sh\nkill -TERM "$PPID"\n' > "$TERM_HOOKS/$_ev"
+  chmod +x "$TERM_HOOKS/$_ev"
+done
+reset_logs
+: > "$REPORT"
+run_script backup.sh FAKE_UPLOAD_FAIL=yes "HOOKS_DIR=$TERM_HOOKS" "PGBACKUP_TELEMETRY_FILE=$REPORT"
+assert_eq "$?" "2" "backup exit code when stopped during error hooks"
+assert_eq "$(result_line)" "pgbackup-result operation=backup outcome=failure exit_code=2 database=appdb duration_s=D pre_backup_s=D dump_s=D verify_s=D upload_s=D backup_error_s=D failed_phase=upload file=backup/appdb_TS.sql.gz" "backup result line when stopped during error hooks"
+assert_eq "$(report_records "$REPORT" | sed 's/.*|begin backup-error/begin backup-error/')" "begin backup-error T|end backup-error T 143|" "error-hook phase records the stop signal"
+reset_logs
+mkdir -p "$WORKDIR/s3/test-bucket/backup"
+printf 'SELECT 1;\n' | gzip > "$WORKDIR/s3/test-bucket/backup/appdb.sql.gz"
+run_script restore.sh BACKUP_FILE=backup/appdb.sql.gz FAKE_PSQL_EXIT=3 "HOOKS_DIR=$TERM_HOOKS"
+assert_eq "$?" "3" "restore exit code when stopped during error hooks"
+if grep -q '^pgbackup-result operation=restore outcome=failure exit_code=3 ' "$WORKDIR/last.out"; then
+  pass
+else
+  fail "restore result line missing when stopped during error hooks"
+fi
+
 # Restore: result line and report records, with drop and create.
 reset_logs
 mkdir -p "$WORKDIR/s3/test-bucket/backup"

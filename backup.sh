@@ -78,6 +78,11 @@ POSTGRES_DUMP_OPTS="$POSTGRES_EXTRA_DUMP_OPTS"
 backup_on_exit() {
   rc=$?
   trap - EXIT
+  # A second stop signal must not cut the cleanup short. The running hook
+  # still gets it, and the backup-error phase records it.
+  stop_status=0
+  trap 'stop_status=143' TERM
+  trap 'stop_status=130' INT
   set +e
   # A phase still open here was interrupted; it ends with the exit code.
   phase_end "$rc"
@@ -85,7 +90,7 @@ backup_on_exit() {
   if [ "$rc" -ne 0 ]; then
     phase_begin backup-error
     run_error_hooks backup-error "$rc"
-    phase_end 0
+    phase_end "$stop_status"
   fi
   print_result_line backup "$rc"
   exit "$rc"

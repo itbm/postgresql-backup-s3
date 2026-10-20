@@ -92,6 +92,11 @@ resolve_latest_backup() {
 restore_on_exit() {
   rc=$?
   trap - EXIT
+  # A second stop signal must not cut the cleanup short. The running hook
+  # still gets it, and the restore-error phase records it.
+  stop_status=0
+  trap 'stop_status=143' TERM
+  trap 'stop_status=130' INT
   set +e
   # A phase still open here was interrupted; it ends with the exit code.
   phase_end "$rc"
@@ -102,7 +107,7 @@ restore_on_exit() {
   if [ "$rc" -ne 0 ]; then
     phase_begin restore-error
     run_error_hooks restore-error "$rc"
-    phase_end 0
+    phase_end "$stop_status"
   fi
   print_result_line restore "$rc"
   exit "$rc"
