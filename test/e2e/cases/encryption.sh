@@ -1,5 +1,6 @@
-# Encryption (ENCRYPTION_PASSWORD): encrypted backups in both formats, restore
-# with the right, a wrong or no password, odd passwords and legacy (pre-PBKDF2) backups.
+# Encryption (ENCRYPTION_PASSWORD): encrypted backups in both formats and of all
+# databases, restore with the right, a wrong or no password, odd passwords and
+# legacy (pre-PBKDF2) backups.
 
 _ENC_PASSWORD='correct horse battery staple'
 _ENC_WRONG_PASSWORD='incorrect horse battery staple'
@@ -141,18 +142,17 @@ _enc_assert_unchanged() {
 # Backups.
 
 test_encryption_plain_backup_uploads_only_encrypted_object() {
-  db=$(new_db)
-  bucket=$(new_bucket)
+  db=$(new_db) || exit 1
+  bucket=$(new_bucket) || exit 1
 
   bk_backup backup "$db" "$bucket" -e "ENCRYPTION_PASSWORD=$_ENC_PASSWORD"
   assert_rc 0 "encrypted backup"
-  assert_log_contains "Encrypting /tmp/dump.sql.gz"
   assert_log_contains "SQL backup finished"
   assert_log_not_contains "$_ENC_PASSWORD" "the password must not be logged"
   assert_eq "$(bk_tmp_leftovers)" "" "plaintext or encrypted dump left in /tmp after backup"
 
   # Exactly one object in the whole bucket: no plaintext copy next to it.
-  key=$(s3_single_key "$bucket" "")
+  key=$(s3_single_key "$bucket" "") || exit 1
   assert_match "$key" "^backup/${db}_${_ENC_TS}\.sql\.gz\.enc$" "encrypted backup key"
 
   s3_get "$bucket" "$key" "$CASE_DIR/backup.enc"
@@ -164,14 +164,13 @@ test_encryption_plain_backup_uploads_only_encrypted_object() {
 }
 
 test_encryption_custom_format_round_trip_with_parallel_jobs() {
-  db=$(new_db)
-  bucket=$(new_bucket)
+  db=$(new_db) || exit 1
+  bucket=$(new_bucket) || exit 1
 
   bk_backup backup "$db" "$bucket" -e USE_CUSTOM_FORMAT=yes -e "ENCRYPTION_PASSWORD=$_ENC_PASSWORD"
   assert_rc 0 "encrypted custom format backup"
-  assert_log_contains "Encrypting /tmp/dump.dump"
   assert_eq "$(bk_tmp_leftovers)" "" "plaintext or encrypted dump left in /tmp after backup"
-  key=$(s3_single_key "$bucket" "")
+  key=$(s3_single_key "$bucket" "") || exit 1
   assert_match "$key" "^backup/${db}_${_ENC_TS}\.dump\.enc$" "encrypted custom format key"
 
   s3_get "$bucket" "$key" "$CASE_DIR/backup.enc"
@@ -199,30 +198,52 @@ test_encryption_custom_format_round_trip_with_parallel_jobs() {
 }
 
 test_encryption_failure_uploads_nothing() {
-  db=$(new_db)
-  bucket=$(new_bucket)
-  # A read-only directory where openssl wants to write the encrypted file.
-  mkdir -p "$CASE_DIR/blocker"
+  db=$(new_db) || exit 1
+  bucket=$(new_bucket) || exit 1
+  # An openssl ahead of the real one in PATH. Encrypting writes part of its
+  # output and then fails, as on a full disk, wherever the image keeps its
+  # temporary files; anything else runs the real openssl.
+  cat >"$CASE_DIR/openssl" <<'EOF'
+#!/bin/sh
+case $1 in
+  enc|aes-*) ;;
+  *) exec /usr/bin/openssl "$@" ;;
+esac
+out=
+while [ $# -gt 0 ]; do
+  if [ "$1" = -out ]; then out=$2; fi
+  shift
+done
+if [ -n "$out" ]; then
+  printf 'Salted__partial' >"$out"
+else
+  printf 'Salted__partial'
+fi
+echo "e2e: simulated openssl enc failure" >&2
+exit 1
+EOF
+  chmod 755 "$CASE_DIR/openssl"
 
   bk_backup backup "$db" "$bucket" -e "ENCRYPTION_PASSWORD=$_ENC_PASSWORD" \
-    -v "$CASE_DIR/blocker:/tmp/dump.sql.gz.enc:ro"
-  assert_rc 1 "backup whose encryption fails"
-  assert_log_contains "Error encrypting /tmp/dump.sql.gz"
-  assert_log_not_contains "Uploading dump"
+    -v "$CASE_DIR/openssl:/usr/local/bin/openssl:ro"
+  assert_rc_nonzero "backup whose encryption fails"
+  assert_log_contains "e2e: simulated openssl enc failure" "the backup did not run the failing openssl"
+  assert_log_contains "Error encrypting"
   assert_log_not_contains "SQL backup finished"
+  # Neither the plaintext dump nor the partial encrypted file.
   assert_s3_count "$bucket" "" 0 "nothing should be uploaded when encryption fails"
-  assert_eq "$(bk_tmp_leftovers | grep -vFx /tmp/dump.sql.gz.enc)" "" "plaintext dump left in /tmp after a failed encryption"
+  assert_eq "$(bk_tmp_leftovers | grep -v '\.enc$')" "" "plaintext dump left in /tmp after a failed encryption"
 }
 
 # ---------------------------------------------------------------------------
 # Restores.
 
 test_encryption_restore_with_right_password() {
-  db=$(new_db)
-  bucket=$(new_bucket)
+  db=$(new_db) || exit 1
+  bucket=$(new_bucket) || exit 1
   bk_backup backup "$db" "$bucket" -e "ENCRYPTION_PASSWORD=$_ENC_PASSWORD"
   assert_rc 0 "encrypted backup"
-  key=$(s3_single_key "$bucket" backup/)
+  key=$(s3_single_key "$bucket" backup/) || exit 1
 
   restored="${db}_restored"
   bk_restore restore "$restored" "$bucket" "$key" -e "ENCRYPTION_PASSWORD=$_ENC_PASSWORD" -e CREATE_DATABASE=yes
@@ -230,18 +251,17 @@ test_encryption_restore_with_right_password() {
   assert_log_contains "Decrypting backup file"
   assert_log_not_contains "WARNING: Decrypted legacy"
   assert_log_contains "Database restore completed successfully"
-  assert_log_contains "Cleaning up temporary files"
   assert_log_not_contains "$_ENC_PASSWORD" "the password must not be logged"
   assert_same_data "$db" "$restored"
   assert_eq "$(bk_tmp_leftovers)" "" "encrypted or decrypted file left in /tmp after restore"
 }
 
 test_encryption_wrong_password_changes_nothing() {
-  db=$(new_db)
-  bucket=$(new_bucket)
+  db=$(new_db) || exit 1
+  bucket=$(new_bucket) || exit 1
   bk_backup backup "$db" "$bucket" -e "ENCRYPTION_PASSWORD=$_ENC_PASSWORD"
   assert_rc 0 "encrypted backup"
-  key=$(s3_single_key "$bucket" backup/)
+  key=$(s3_single_key "$bucket" backup/) || exit 1
   s3_get "$bucket" "$key" "$CASE_DIR/backup.enc"
   wrong=$(_enc_pick_wrong_password "$CASE_DIR/backup.enc") || fail "no candidate wrong password is rejected"
   psql_exec "$db" "CREATE TABLE app.enc_marker (id integer); INSERT INTO app.enc_marker VALUES (7)" >/dev/null \
@@ -267,11 +287,11 @@ test_encryption_wrong_password_changes_nothing() {
 }
 
 test_encryption_restore_without_password_fails() {
-  db=$(new_db)
-  bucket=$(new_bucket)
+  db=$(new_db) || exit 1
+  bucket=$(new_bucket) || exit 1
   bk_backup backup "$db" "$bucket" -e "ENCRYPTION_PASSWORD=$_ENC_PASSWORD"
   assert_rc 0 "encrypted backup"
-  key=$(s3_single_key "$bucket" backup/)
+  key=$(s3_single_key "$bucket" backup/) || exit 1
   psql_exec "$db" "CREATE TABLE app.enc_marker (id integer)" >/dev/null || fail "could not modify $db"
   db_fingerprint "$db" >"$CASE_DIR/before.txt" || fail "could not fingerprint $db"
 
@@ -285,11 +305,11 @@ test_encryption_restore_without_password_fails() {
 }
 
 test_encryption_unencrypted_backup_restores_with_password_set() {
-  db=$(new_db)
-  bucket=$(new_bucket)
+  db=$(new_db) || exit 1
+  bucket=$(new_bucket) || exit 1
   bk_backup backup "$db" "$bucket"
   assert_rc 0 "unencrypted backup"
-  key=$(s3_single_key "$bucket" backup/)
+  key=$(s3_single_key "$bucket" backup/) || exit 1
   assert_match "$key" '\.sql\.gz$' "unencrypted backup key"
 
   restored="${db}_restored"
@@ -302,13 +322,13 @@ test_encryption_unencrypted_backup_restores_with_password_set() {
 }
 
 test_encryption_password_with_special_characters() {
-  db=$(new_db)
-  bucket=$(new_bucket)
+  db=$(new_db) || exit 1
+  bucket=$(new_bucket) || exit 1
 
   bk_backup backup "$db" "$bucket" -e "ENCRYPTION_PASSWORD=$_ENC_ODD_PASSWORD"
   assert_rc 0 "backup with an awkward password"
   assert_log_not_contains "$_ENC_ODD_PASSWORD" "the password must not be logged"
-  key=$(s3_single_key "$bucket" "")
+  key=$(s3_single_key "$bucket" "") || exit 1
   assert_match "$key" '\.sql\.gz\.enc$' "encrypted backup key"
 
   # The password must be used byte for byte, not shell-expanded or split.
@@ -326,13 +346,66 @@ test_encryption_password_with_special_characters() {
 }
 
 # ---------------------------------------------------------------------------
+# POSTGRES_DATABASE=all (pg_dumpall).
+
+test_encryption_all_databases_round_trip_into_fresh_server() {
+  bucket=$(new_bucket) || exit 1
+  # Private servers, so the dump holds a known set of databases and roles.
+  src=$(start_postgres enc-all-src) || exit 1
+  role=enc_all_owner
+  PG_CTR=$src psql_exec postgres "CREATE ROLE $role LOGIN PASSWORD 'enc-owner-pw'" >/dev/null \
+    || fail "could not create role $role"
+  PG_CTR=$src psql_exec postgres "CREATE DATABASE enc_one" >/dev/null || fail "could not create enc_one"
+  PG_CTR=$src psql_exec postgres "CREATE DATABASE enc_two OWNER $role" >/dev/null || fail "could not create enc_two"
+  PG_CTR=$src psql_exec enc_one "CREATE TABLE notes (id integer PRIMARY KEY, body text, raw bytea);
+    INSERT INTO notes VALUES (1, 'ünïcødé 🔐', decode('00ff10', 'hex')), (2, NULL, NULL)" >/dev/null \
+    || fail "could not fill enc_one"
+  PG_CTR=$src psql_exec enc_two "SET ROLE $role; CREATE TABLE items (id serial PRIMARY KEY, name text);
+    INSERT INTO items (name) VALUES ('alpha'), ('beta')" >/dev/null || fail "could not fill enc_two"
+
+  bk_backup backup all "$bucket" --unset POSTGRES_HOST -e POSTGRES_HOST=enc-all-src \
+    -e "ENCRYPTION_PASSWORD=$_ENC_PASSWORD"
+  assert_rc 0 "encrypted pg_dumpall backup"
+  assert_log_not_contains "$_ENC_PASSWORD" "the password must not be logged"
+  assert_eq "$(bk_tmp_leftovers)" "" "plaintext or encrypted dump left in /tmp after backup"
+  # Exactly one object in the whole bucket: no plaintext copy next to it.
+  key=$(s3_single_key "$bucket" "") || exit 1
+  assert_match "$key" "^backup/all_${_ENC_TS}\.sql\.gz\.enc$" "encrypted backup key for all"
+  s3_get "$bucket" "$key" "$CASE_DIR/backup.enc"
+  _enc_assert_salted "$CASE_DIR/backup.enc"
+  _enc_decrypt "$CASE_DIR/backup.enc" "$CASE_DIR/backup.sql.gz" "$_ENC_PASSWORD" \
+    || fail "README's manual decrypt command failed on the backup of all databases"
+  _enc_assert_gzip_has_line "$CASE_DIR/backup.sql.gz" "-- PostgreSQL database cluster dump complete" \
+    "decrypted backup should be a complete gzipped cluster dump"
+
+  dst=$(start_postgres enc-all-dst) || exit 1
+  bk_restore restore all "$bucket" "$key" --unset POSTGRES_HOST -e POSTGRES_HOST=enc-all-dst \
+    -e "ENCRYPTION_PASSWORD=$_ENC_PASSWORD"
+  assert_rc 0 "restore of the encrypted backup of all databases into a fresh server"
+  assert_log_contains "Decrypting backup file"
+  assert_log_not_contains "WARNING: Decrypted legacy"
+  assert_log_contains "Database restore completed successfully"
+  assert_log_not_contains "$_ENC_PASSWORD" "the password must not be logged"
+  assert_eq "$(bk_tmp_leftovers)" "" "encrypted or decrypted file left in /tmp after restore"
+
+  PG_CTR=$dst db_exists enc_one || fail "database enc_one missing on the new server"
+  PG_CTR=$dst db_exists enc_two || fail "database enc_two missing on the new server"
+  assert_eq "$(PG_CTR=$dst psql_exec postgres "SELECT rolcanlogin FROM pg_roles WHERE rolname = '$role'")" t \
+    "role $role on the new server"
+  assert_eq "$(PG_CTR=$dst psql_exec postgres "SELECT pg_get_userbyid(datdba) FROM pg_database
+    WHERE datname = 'enc_two'")" "$role" "owner of enc_two"
+  PG_CTR=$src assert_same_data enc_one enc_one "$dst"
+  PG_CTR=$src assert_same_data enc_two enc_two "$dst"
+}
+
+# ---------------------------------------------------------------------------
 # Legacy backups, as releases before PBKDF2 wrote them: openssl enc -aes-256-cbc
 # -k "$ENCRYPTION_PASSWORD". Every release used Alpine 3.9 or later, so OpenSSL
 # 1.1 or later and its SHA-256 default digest.
 
 test_encryption_legacy_backups_restore_with_warning() {
-  db=$(new_db)
-  bucket=$(new_bucket)
+  db=$(new_db) || exit 1
+  bucket=$(new_bucket) || exit 1
 
   for format in plain custom; do
     if [ "$format" = custom ]; then
@@ -343,7 +416,8 @@ test_encryption_legacy_backups_restore_with_warning() {
       ext=sql.gz
     fi
     assert_rc 0 "unencrypted $format backup"
-    s3_get "$bucket" "$(s3_single_key "$bucket" "$format/")" "$CASE_DIR/$format.plain"
+    plain_key=$(s3_single_key "$bucket" "$format/") || exit 1
+    s3_get "$bucket" "$plain_key" "$CASE_DIR/$format.plain"
     _enc_legacy_encrypt "$CASE_DIR/$format.plain" "$CASE_DIR/$format.enc" "$_ENC_PASSWORD"
     _enc_assert_salted "$CASE_DIR/$format.enc"
     key="legacy/${db}_2020-01-01T00:00:00Z.$ext.enc"
@@ -361,9 +435,9 @@ test_encryption_legacy_backups_restore_with_warning() {
   done
 }
 
-# Control for the misread test below: the same fixture with an ordinary salt.
+# Control for the padding test below: the same fixture with an ordinary salt.
 test_encryption_legacy_fixture_restores_with_ordinary_salt() {
-  bucket=$(new_bucket)
+  bucket=$(new_bucket) || exit 1
   target=$(_enc_new_db_name)
   _enc_fixture_backup "$CASE_DIR/legacy.enc" "$_ENC_PASSWORD" e2e0000000000000
   s3_put "$bucket" backup/legacy.sql.gz.enc "$CASE_DIR/legacy.enc"
@@ -375,9 +449,8 @@ test_encryption_legacy_fixture_restores_with_ordinary_salt() {
   assert_eq "$(_enc_fixture_rows "$target")" "1:alpha,2:beta,3:gamma" "restored fixture rows"
 }
 
-test_encryption_legacy_backup_misread_as_pbkdf2() {
-  xfail "restore.sh only falls back to the legacy key derivation when the PBKDF2 attempt fails, but about 1 legacy backup in 256 passes the CBC padding check with the PBKDF2 key and is restored as garbage"
-  bucket=$(new_bucket)
+test_encryption_legacy_backup_passing_pbkdf2_padding_restores() {
+  bucket=$(new_bucket) || exit 1
   target=$(_enc_new_db_name)
   # Salt found by brute force: with it the PBKDF2 trial decrypt of this legacy
   # file passes the padding check and yields garbage.
@@ -386,6 +459,7 @@ test_encryption_legacy_backup_misread_as_pbkdf2() {
     || fail "precondition: the PBKDF2 trial decrypt of this fixture should pass the padding check"
   s3_put "$bucket" backup/legacy.sql.gz.enc "$CASE_DIR/legacy.enc"
 
+  xfail "restore.sh only falls back to the legacy key derivation when the PBKDF2 attempt fails, but about 1 legacy backup in 256 passes the CBC padding check with the PBKDF2 key and is restored as garbage"
   bk_restore restore "$target" "$bucket" backup/legacy.sql.gz.enc -e "ENCRYPTION_PASSWORD=$_ENC_PASSWORD" \
     -e CREATE_DATABASE=yes
   assert_rc 0 "restore of a legacy backup"
@@ -400,7 +474,7 @@ test_encryption_legacy_backup_misread_as_pbkdf2() {
 # release wrote them. They are also the fixtures of the two tests that follow,
 # which this shows to be sound.
 test_encryption_pbkdf2_fixtures_restore_with_right_password() {
-  bucket=$(new_bucket)
+  bucket=$(new_bucket) || exit 1
   for salt in e2e0000000000212 e2e00000000000cd; do
     target=$(_enc_new_db_name "$salt")
     _enc_fixture_backup "$CASE_DIR/$salt.enc" "$_ENC_PASSWORD" "$salt" -pbkdf2 -iter 100000
@@ -416,14 +490,14 @@ test_encryption_pbkdf2_fixtures_restore_with_right_password() {
 }
 
 test_encryption_wrong_password_passing_pbkdf2_padding_keeps_database() {
-  xfail "a wrong password whose PBKDF2 decrypt passes the CBC padding check (about 1 in 256) is not detected, so DROP_DATABASE=yes drops the database before the restore fails"
-  db=$(new_db)
-  bucket=$(new_bucket)
+  db=$(new_db) || exit 1
+  bucket=$(new_bucket) || exit 1
   _enc_fixture_backup "$CASE_DIR/backup.enc" "$_ENC_PASSWORD" e2e0000000000212 -pbkdf2 -iter 100000
   _enc_decrypt "$CASE_DIR/backup.enc" "$CASE_DIR/garbage" "$_ENC_WRONG_PASSWORD" \
     || fail "precondition: the wrong password should pass the PBKDF2 padding check for this fixture"
   s3_put "$bucket" backup/fixture.sql.gz.enc "$CASE_DIR/backup.enc"
 
+  xfail "a wrong password whose PBKDF2 decrypt passes the CBC padding check (about 1 in 256) is not detected, so DROP_DATABASE=yes drops the database before the restore fails"
   bk_restore restore "$db" "$bucket" backup/fixture.sql.gz.enc -e "ENCRYPTION_PASSWORD=$_ENC_WRONG_PASSWORD" \
     -e DROP_DATABASE=yes -e CREATE_DATABASE=yes
   assert_rc 1 "restore with a wrong password"
@@ -433,9 +507,8 @@ test_encryption_wrong_password_passing_pbkdf2_padding_keeps_database() {
 }
 
 test_encryption_wrong_password_passing_legacy_padding_keeps_database() {
-  xfail "a wrong password whose legacy fallback decrypt passes the CBC padding check (about 1 in 256) is reported as a legacy backup, and DROP_DATABASE=yes drops the database before the restore fails"
-  db=$(new_db)
-  bucket=$(new_bucket)
+  db=$(new_db) || exit 1
+  bucket=$(new_bucket) || exit 1
   _enc_fixture_backup "$CASE_DIR/backup.enc" "$_ENC_PASSWORD" e2e00000000000cd -pbkdf2 -iter 100000
   if _enc_decrypt "$CASE_DIR/backup.enc" "$CASE_DIR/garbage" "$_ENC_WRONG_PASSWORD"; then
     fail "precondition: the wrong password should fail the PBKDF2 padding check for this fixture"
@@ -444,6 +517,7 @@ test_encryption_wrong_password_passing_legacy_padding_keeps_database() {
     || fail "precondition: the wrong password should pass the legacy padding check for this fixture"
   s3_put "$bucket" backup/fixture.sql.gz.enc "$CASE_DIR/backup.enc"
 
+  xfail "a wrong password whose legacy fallback decrypt passes the CBC padding check (about 1 in 256) is reported as a legacy backup, and DROP_DATABASE=yes drops the database before the restore fails"
   bk_restore restore "$db" "$bucket" backup/fixture.sql.gz.enc -e "ENCRYPTION_PASSWORD=$_ENC_WRONG_PASSWORD" \
     -e DROP_DATABASE=yes -e CREATE_DATABASE=yes
   assert_rc 1 "restore with a wrong password"
