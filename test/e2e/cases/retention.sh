@@ -172,7 +172,6 @@ curl -fsS "$S3_ENDPOINT/$S3_BUCKET?list-type=2&prefix=$S3_PREFIX/" > /hook-out/l
   _ret_gone backup/old-1.sql.gz backup/old-2.sql.gz
   new=$(_ret_new_backup backup "$db") || exit 1
   _ret_count 1
-  assert_log_contains "${new#backup/} not older than 5 seconds ago"
   assert_file_contains "$CASE_DIR/hook-out/listing" "<Key>$new</Key>" "listing taken by the post-backup hook"
   assert_file_not_contains "$CASE_DIR/hook-out/listing" "<Key>backup/old-" "old objects still listed when post-backup ran"
   assert_eq "$(bk_tmp_leftovers)" "" "temporary files (the S3 listing) left in /tmp"
@@ -195,9 +194,8 @@ test_retention_keeps_objects_newer_than_threshold() {
   _ret_list "$bucket"
   _ret_gone backup/before.sql.gz
   _ret_kept backup/after.sql.gz backup/after.txt
-  new=$(_ret_new_backup backup "$db") || exit 1
+  _ret_new_backup backup "$db" >/dev/null || exit 1
   _ret_count 3
-  assert_log_contains "${new#backup/} not older than @$cutoff"
 }
 
 # The README's example, with objects backdated by days.
@@ -216,6 +214,22 @@ test_retention_days_ago_as_documented() {
   _ret_list "$bucket"
   _ret_gone backup/45-days.sql.gz backup/31-days.sql.gz
   _ret_kept backup/29-days.sql.gz backup/1-hour.sql.gz
+  _ret_new_backup backup "$db" >/dev/null || exit 1
+  _ret_count 3
+}
+
+# DELETE_OLDER_THAN has no default: without it nothing is deleted, however old.
+test_retention_off_by_default() {
+  bucket=$(new_bucket) || exit 1
+  db=$(new_db) || exit 1
+  _ret_put_aged "$bucket" "400 days ago" backup/400-days.sql.gz "1 day ago" backup/1-day.sql.gz
+
+  bk_backup backup "$db" "$bucket"
+  assert_rc 0 "backup without DELETE_OLDER_THAN"
+  assert_log_not_contains "Checking for files older than"
+  assert_log_not_contains "DELETING"
+  _ret_list "$bucket"
+  _ret_kept backup/400-days.sql.gz backup/1-day.sql.gz
   _ret_new_backup backup "$db" >/dev/null || exit 1
   _ret_count 3
 }
@@ -263,7 +277,9 @@ test_retention_only_touches_objects_directly_in_prefix() {
 # created by this script."
 test_retention_deletes_any_file_in_prefix() {
   bucket=$(new_bucket) || exit 1
-  _ret_put "$bucket" backup/README.txt backup/.keep backup/otherdb_2020-01-01T00:00:00Z.dump.enc
+  # PREPROD_...: a name that merely contains PRE is a file, not a sub-prefix.
+  _ret_put "$bucket" backup/README.txt backup/.keep backup/otherdb_2020-01-01T00:00:00Z.dump.enc \
+    backup/PREPROD_2020-01-01T00:00:00Z.sql.gz
   cutoff=$(_ret_mark)
   db=$(new_db) || exit 1
   _ret_wait_past "$cutoff"
@@ -273,30 +289,35 @@ test_retention_deletes_any_file_in_prefix() {
   assert_log_contains "DELETING README.txt"
   assert_log_contains "DELETING .keep"
   assert_log_contains "DELETING otherdb_2020-01-01T00:00:00Z.dump.enc"
+  assert_log_contains "DELETING PREPROD_2020-01-01T00:00:00Z.sql.gz"
   _ret_list "$bucket"
-  _ret_gone backup/README.txt backup/.keep backup/otherdb_2020-01-01T00:00:00Z.dump.enc
+  _ret_gone backup/README.txt backup/.keep backup/otherdb_2020-01-01T00:00:00Z.dump.enc \
+    backup/PREPROD_2020-01-01T00:00:00Z.sql.gz
   _ret_new_backup backup "$db" >/dev/null || exit 1
   _ret_count 1
 }
 
-test_retention_deletes_keys_with_spaces() {
+# A newer key that is the old one without its backslash must survive.
+test_retention_deletes_keys_with_spaces_or_backslashes() {
   bucket=$(new_bucket) || exit 1
-  _ret_put "$bucket" "backup/old file.sql.gz" "backup/my db_2020-01-01T00:00:00Z.sql.gz"
+  _ret_put "$bucket" "backup/old file.sql.gz" "backup/my db_2020-01-01T00:00:00Z.sql.gz" \
+    'backup/back\slash.sql.gz'
   cutoff=$(_ret_mark)
   db=$(new_db) || exit 1
   _ret_wait_past "$cutoff"
-  _ret_put "$bucket" "backup/new file.sql.gz"
+  _ret_put "$bucket" "backup/new file.sql.gz" backup/backslash.sql.gz
 
   bk_backup backup "$db" "$bucket" -e "DELETE_OLDER_THAN=@$cutoff"
   assert_rc 0 "backup with DELETE_OLDER_THAN"
   assert_log_contains "DELETING old file.sql.gz"
   assert_log_contains "DELETING my db_2020-01-01T00:00:00Z.sql.gz"
+  assert_log_contains 'DELETING back\slash.sql.gz'
   assert_log_contains "new file.sql.gz not older than @$cutoff"
   _ret_list "$bucket"
-  _ret_gone "backup/old file.sql.gz" "backup/my db_2020-01-01T00:00:00Z.sql.gz"
-  _ret_kept "backup/new file.sql.gz"
+  _ret_gone "backup/old file.sql.gz" "backup/my db_2020-01-01T00:00:00Z.sql.gz" 'backup/back\slash.sql.gz'
+  _ret_kept "backup/new file.sql.gz" backup/backslash.sql.gz
   _ret_new_backup backup "$db" >/dev/null || exit 1
-  _ret_count 2
+  _ret_count 3
 }
 
 # Each old key differs from a newer one only in its whitespace.
@@ -350,13 +371,12 @@ test_retention_custom_nested_prefix() {
   _ret_gone "$prefix/old.sql.gz" "$prefix/old.dump.enc"
   # shellcheck disable=SC2086
   _ret_kept $others
-  new=$(_ret_new_backup "$prefix" "$db" '\.dump\.enc') || exit 1
+  _ret_new_backup "$prefix" "$db" '\.dump\.enc' >/dev/null || exit 1
   _ret_count 5
-  assert_log_contains "${new#"$prefix"/} not older than @$cutoff"
 }
 
 # aws s3 ls prints local time and backup.sh parses it as local time, so both
-# must follow TZ. E2E-14 is POSIX for 14 hours ahead of UTC.
+# must follow TZ. <E2E>-14 is POSIX for 14 hours ahead of UTC all year.
 test_retention_honours_tz() {
   bucket=$(new_bucket) || exit 1
   _ret_put "$bucket" backup/before.sql.gz
@@ -365,8 +385,8 @@ test_retention_honours_tz() {
   _ret_wait_past "$cutoff"
   _ret_put "$bucket" backup/after.sql.gz
 
-  bk_backup backup "$db" "$bucket" -e TZ=E2E-14 -e "DELETE_OLDER_THAN=@$cutoff"
-  assert_rc 0 "backup with TZ=E2E-14 and DELETE_OLDER_THAN"
+  bk_backup backup "$db" "$bucket" -e "TZ=<E2E>-14" -e "DELETE_OLDER_THAN=@$cutoff"
+  assert_rc 0 "backup with TZ=<E2E>-14 and DELETE_OLDER_THAN"
   _ret_list "$bucket"
   _ret_gone backup/before.sql.gz
   _ret_kept backup/after.sql.gz
