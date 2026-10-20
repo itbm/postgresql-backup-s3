@@ -235,6 +235,11 @@ test_backup_custom_format() {
 
   s3_get "$bucket" "$key" "$CASE_DIR/dump.dump"
   assert_eq "$(head -c 5 "$CASE_DIR/dump.dump")" "PGDMP" "custom-format archive magic"
+  # README promises built-in compression; an uncompressed archive says "none".
+  _backup_tool pg_restore -l <"$CASE_DIR/dump.dump" >"$CASE_DIR/toc.txt" || fail "pg_restore cannot list the archive"
+  compression=$(sed -n 's/^;[[:space:]]*Compression: *//p' "$CASE_DIR/toc.txt")
+  assert_match "$compression" '^[a-z0-9]+' "compression in the archive header"
+  assert_ne "$compression" "none" "custom-format archive compression"
   _backup_load_custom "$CASE_DIR/dump.dump" "${db}_loaded"
   assert_same_data "$db" "${db}_loaded"
 }
@@ -290,14 +295,14 @@ test_backup_all_plain_pg_dumpall() {
   assert_file_contains "$sql" "-- PostgreSQL database cluster dump complete"
 }
 
-test_backup_all_honours_extra_dump_opts_and_extra_opts() {
+test_backup_all_honours_dump_and_compression_options() {
   ctr=$(start_postgres bkallx) || exit 1
   _backup_make_cluster "$ctr"
   bucket=$(new_bucket) || exit 1
 
-  bk_backup backup all "$bucket" -e POSTGRES_HOST=bkallx \
+  bk_backup backup all "$bucket" -e POSTGRES_HOST=bkallx -e "COMPRESSION_CMD=gzip -9" \
     -e POSTGRES_EXTRA_DUMP_OPTS=--exclude-database=db_two -e POSTGRES_EXTRA_OPTS=--verbose
-  assert_rc 0 "pg_dumpall backup with --exclude-database and --verbose"
+  assert_rc 0 "pg_dumpall backup with --exclude-database, --verbose and gzip -9"
   assert_log_contains 'pg_dumpall: dumping database "db_one"' "POSTGRES_EXTRA_OPTS=--verbose did not reach pg_dumpall"
   assert_log_contains 'pg_dumpall: excluding database "db_two"'
   # Verbose pg_dumpall prints its connection strings; the password must not be in them.
@@ -306,6 +311,8 @@ test_backup_all_honours_extra_dump_opts_and_extra_opts() {
   key=$(s3_single_key "$bucket" backup/) || exit 1
   _backup_assert_key "$key" "backup/all" .sql.gz
   _backup_fetch_plain "$bucket" "$key" all
+  # gzip XFL byte 02: COMPRESSION_CMD and its argument reached the pg_dumpall pipeline.
+  assert_eq "$(od -An -tx1 -j8 -N1 "$CASE_DIR/all.sql.gz" | tr -d ' \n')" "02" "gzip XFL byte of the pg_dumpall backup"
   sql=$CASE_DIR/all.sql
   assert_file_contains "$sql" '\connect db_one'
   assert_file_contains "$sql" "marker-of-db-one"
@@ -344,17 +351,38 @@ test_backup_postgres_port_non_default() {
   _backup_assert_key "$key" "backup/port_db" .sql.gz
   _backup_fetch_plain "$bucket" "$key" dump
   assert_file_contains "$CASE_DIR/dump.sql" "reached-on-port-5433"
+
+  # The custom-format and pg_dumpall commands are built separately.
+  bucket_fc=$(new_bucket fc) || exit 1
+  bk_backup port-5433-custom port_db "$bucket_fc" -e POSTGRES_HOST=bkport -e POSTGRES_PORT=5433 \
+    -e USE_CUSTOM_FORMAT=yes
+  assert_rc 0 "custom-format backup with POSTGRES_PORT=5433"
+  key=$(s3_single_key "$bucket_fc" backup/) || exit 1
+  _backup_assert_key "$key" "backup/port_db" .dump
+  s3_get "$bucket_fc" "$key" "$CASE_DIR/dump.dump"
+  _backup_tool pg_restore -f - <"$CASE_DIR/dump.dump" >"$CASE_DIR/dump-fc.sql" || fail "pg_restore cannot read the archive"
+  assert_file_contains "$CASE_DIR/dump-fc.sql" "reached-on-port-5433"
+
+  bucket_all=$(new_bucket all) || exit 1
+  bk_backup port-5433-all all "$bucket_all" -e POSTGRES_HOST=bkport -e POSTGRES_PORT=5433
+  assert_rc 0 "pg_dumpall backup with POSTGRES_PORT=5433"
+  key=$(s3_single_key "$bucket_all" backup/) || exit 1
+  _backup_assert_key "$key" "backup/all" .sql.gz
+  _backup_fetch_plain "$bucket_all" "$key" all
+  assert_file_contains "$CASE_DIR/all.sql" '\connect port_db'
+  assert_file_contains "$CASE_DIR/all.sql" "reached-on-port-5433"
 }
 
 test_backup_docker_link_env_fallback() {
   # Legacy Docker links: without POSTGRES_HOST, host and port come from
-  # POSTGRES_PORT_5432_TCP_ADDR and POSTGRES_PORT_5432_TCP_PORT.
+  # POSTGRES_PORT_5432_TCP_ADDR and POSTGRES_PORT_5432_TCP_PORT. A link aliased
+  # "postgres" also sets POSTGRES_PORT to a tcp:// URL, which must not be used.
   ctr=$(start_postgres bklink 5433) || exit 1
   _backup_sql "$ctr" 5433 postgres "CREATE DATABASE link_db"
   _backup_sql "$ctr" 5433 link_db "CREATE TABLE link_marker (v text); INSERT INTO link_marker VALUES ('reached-through-link-env')"
   bucket=$(new_bucket) || exit 1
 
-  bk_backup backup link_db "$bucket" --unset POSTGRES_HOST \
+  bk_backup backup link_db "$bucket" --unset POSTGRES_HOST -e POSTGRES_PORT=tcp://bklink:5433 \
     -e POSTGRES_PORT_5432_TCP_ADDR=bklink -e POSTGRES_PORT_5432_TCP_PORT=5433
   assert_rc 0 "backup through Docker link variables"
   assert_log_contains "Creating dump of link_db database from bklink..."
@@ -487,6 +515,11 @@ test_backup_extra_opts_reach_pg_dump_and_pg_dumpall() {
   assert_log_not_contains "$PG_PASSWORD" "PostgreSQL password in the verbose log"
   assert_s3_count "$bucket" backup/ 1 "objects after the verbose backup"
 
+  bk_backup verbose-custom "$db" "$bucket" -e USE_CUSTOM_FORMAT=yes -e POSTGRES_EXTRA_OPTS=--verbose
+  assert_rc 0 "custom-format backup with POSTGRES_EXTRA_OPTS=--verbose"
+  assert_log_contains 'pg_dump: dumping contents of table "app.users"' "--verbose did not reach the custom-format pg_dump"
+  assert_s3_count "$bucket" backup/ 2 "objects after the verbose backups"
+
   bk_backup invalid "$db" "$bucket" -e POSTGRES_EXTRA_OPTS=--no-such-option
   assert_rc_nonzero "pg_dump with an invalid option"
   assert_log_contains "pg_dump: unrecognized option"
@@ -497,7 +530,7 @@ test_backup_extra_opts_reach_pg_dump_and_pg_dumpall() {
   assert_rc_nonzero "pg_dumpall with an invalid option"
   assert_log_contains "pg_dumpall: unrecognized option"
   assert_log_not_contains "Uploading dump to" "failed pg_dumpall still uploaded"
-  assert_s3_count "$bucket" backup/ 1 "objects after the failed backups"
+  assert_s3_count "$bucket" backup/ 2 "objects after the failed backups"
 }
 
 # ---------------------------------------------------------------------------
@@ -573,6 +606,17 @@ test_backup_database_names_needing_quoting() {
     assert_file_contains "$CASE_DIR/name$i.sql" "name-marker-$i-end" "dump of '$name' is not of that database"
   done
   assert_s3_count "$bucket" "" 5 "objects for five databases"
+
+  # The custom-format command is built separately.
+  spaced="${base} with space"
+  bucket_fc=$(new_bucket fc) || exit 1
+  bk_backup custom "$spaced" "$bucket_fc" -e USE_CUSTOM_FORMAT=yes
+  assert_rc 0 "custom-format backup of database '$spaced'"
+  key=$(s3_single_key "$bucket_fc" backup/) || exit 1
+  _backup_assert_key "$key" "backup/$spaced" .dump
+  s3_get "$bucket_fc" "$key" "$CASE_DIR/custom.dump"
+  _backup_tool pg_restore -f - <"$CASE_DIR/custom.dump" >"$CASE_DIR/custom.sql" || fail "pg_restore cannot read the archive"
+  assert_file_contains "$CASE_DIR/custom.sql" "name-marker-3-end" "custom-format dump of '$spaced' is not of that database"
 }
 
 test_backup_database_name_starting_with_hyphen() {
