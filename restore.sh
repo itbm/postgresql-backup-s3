@@ -65,10 +65,17 @@ strip_transaction_timeout() {
   '
 }
 
+# Prints the server_version_num of the server, connecting to database $1.
+# Expanded output (psql -x in POSTGRES_EXTRA_OPTS) prints it as "name|value".
+server_version_num() {
+  _version=$(psql $POSTGRES_HOST_OPTS -d "$1" -Atq -c "SHOW server_version_num")
+  printf '%s\n' "${_version##*|}"
+}
+
 # Writes the plain SQL backup to stdout, ready for psql on a server whose
 # server_version_num is $1.
 plain_sql() {
-  if [ "$1" -lt 170000 ]; then
+  if is_positive_int "$1" && [ "$1" -lt 170000 ]; then
     $DECOMPRESSION_CMD "$DOWNLOAD_PATH" | strip_transaction_timeout
   else
     $DECOMPRESSION_CMD "$DOWNLOAD_PATH"
@@ -217,11 +224,11 @@ case "$DOWNLOAD_PATH" in
   *.sql.gz)
     if [ "${POSTGRES_DATABASE}" = "all" ]; then
       echo "Restoring all databases"
-      version=$(psql $POSTGRES_HOST_OPTS -d postgres -Atq -c "SHOW server_version_num")
+      version=$(server_version_num postgres)
       plain_sql "$version" | psql $POSTGRES_HOST_OPTS $PSQL_RESTORE_OPTS -d postgres
     else
       echo "Restoring database ${POSTGRES_DATABASE}"
-      version=$(psql $POSTGRES_HOST_OPTS -d "$POSTGRES_DATABASE" -Atq -c "SHOW server_version_num")
+      version=$(server_version_num "$POSTGRES_DATABASE")
       plain_sql "$version" | psql $POSTGRES_HOST_OPTS $PSQL_RESTORE_OPTS -d "$POSTGRES_DATABASE"
     fi
     ;;

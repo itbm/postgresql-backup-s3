@@ -294,7 +294,12 @@ printf '%s\n' "\$*" >> "$WORKDIR/psql.log"
 case " \$* " in
   *" -c "*)
     case "\$*" in
-      *server_version_num*) echo "\${FAKE_PG_VERSION:-180000}" ;;
+      *server_version_num*)
+        case " \$* " in
+          *" -x "*) echo "server_version_num|\${FAKE_PG_VERSION:-180000}" ;;
+          *) echo "\${FAKE_PG_VERSION:-180000}" ;;
+        esac
+        ;;
       *"FROM pg_database"*) if [ "\${FAKE_DB_EXISTS:-no}" = yes ]; then echo 1; fi ;;
       *"DROP DATABASE"*) if [ "\${FAKE_DROP_FAIL:-no}" = yes ]; then exit 1; fi ;;
     esac
@@ -624,6 +629,9 @@ assert_ok run_script restore.sh BACKUP_FILE=backup/appdb.sql.gz FAKE_PG_VERSION=
 assert_eq "$(grep -c 'transaction_timeout' "$WORKDIR/psql.stdin")" "1" "transaction_timeout lines restored into PostgreSQL 16"
 assert_ok run_script restore.sh BACKUP_FILE=backup/appdb.sql.gz
 assert_eq "$(grep -c 'transaction_timeout' "$WORKDIR/psql.stdin")" "2" "transaction_timeout lines restored into PostgreSQL 18"
+# -x in POSTGRES_EXTRA_OPTS (no privileges for pg_dump) is expanded output for psql.
+assert_ok run_script restore.sh BACKUP_FILE=backup/appdb.sql.gz FAKE_PG_VERSION=160004 POSTGRES_EXTRA_OPTS=-x
+assert_eq "$(grep -c 'transaction_timeout' "$WORKDIR/psql.stdin")" "1" "transaction_timeout lines restored into PostgreSQL 16 with psql -x"
 
 RESTORE_EVENTS="$WORKDIR/restore.events"
 for ev in pre-restore post-restore restore-error; do
