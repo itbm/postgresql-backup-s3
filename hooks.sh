@@ -202,8 +202,18 @@ hook_run_script() {
 
   echo "Running script hook for ${_hook_event}"
 
+  # Every hook gets HOOK_EVENT, and error hooks get HOOK_EXIT_CODE.
+  set -- "HOOK_EVENT=${_hook_event}"
+  case "$_hook_event" in
+    *-error)
+      if [ -n "$HOOK_EXIT_CODE" ]; then
+        set -- "$@" "HOOK_EXIT_CODE=$HOOK_EXIT_CODE"
+      fi
+      ;;
+  esac
+
   if [ "${HOOK_INHERIT_ENV}" = "yes" ]; then
-    hook_run_as_hook "$_hook_script_real" "$_hook_event"
+    hook_run_as_hook env "$@" "$_hook_script_real" "$_hook_event"
     return $?
   fi
 
@@ -211,7 +221,7 @@ hook_run_script() {
   set -- env -i \
     "PATH=/usr/local/bin:/usr/bin:/bin" \
     "HOME=/tmp" \
-    "HOOK_EVENT=${_hook_event}"
+    "$@"
 
   if hook_has_value "$TZ"; then
     set -- "$@" "TZ=$TZ"
@@ -249,13 +259,6 @@ hook_run_script() {
   if hook_has_value "$BACKUP_FILE"; then
     set -- "$@" "BACKUP_FILE=$BACKUP_FILE"
   fi
-  case "$_hook_event" in
-    *-error)
-      if [ -n "$HOOK_EXIT_CODE" ]; then
-        set -- "$@" "HOOK_EXIT_CODE=$HOOK_EXIT_CODE"
-      fi
-      ;;
-  esac
 
   set -- "$@" "$_hook_script_real" "$_hook_event"
   hook_run_as_hook "$@"

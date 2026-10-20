@@ -134,7 +134,38 @@ setup_aws() {
 
 setup_postgres() {
   export PGPASSWORD=$POSTGRES_PASSWORD
-  POSTGRES_HOST_OPTS="-h $POSTGRES_HOST -p $POSTGRES_PORT -U $POSTGRES_USER $POSTGRES_EXTRA_OPTS"
+  # The user reaches libpq through the environment, so a role name with a space
+  # stays intact; leading and trailing whitespace is dropped as before.
+  # POSTGRES_EXTRA_OPTS can still override it with -U.
+  PGUSER=${POSTGRES_USER#"${POSTGRES_USER%%[![:space:]]*}"}
+  PGUSER=${PGUSER%"${PGUSER##*[![:space:]]}"}
+  export PGUSER
+  POSTGRES_HOST_OPTS="-h $POSTGRES_HOST -p $POSTGRES_PORT $POSTGRES_EXTRA_OPTS"
+}
+
+# Prints a libpq connection string for database $1. Passed with -d, it stops
+# pg_dump, psql and pg_restore reading a name that starts with "-" as an option
+# or a name that contains "=" as a connection string.
+conninfo_dbname() {
+  printf "dbname='%s'" "$(printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e "s/'/\\\\'/g")"
+}
+
+# Splits a line of "aws s3 ls" output into S3_LS_DATE ("YYYY-MM-DD HH:MM:SS")
+# and S3_LS_NAME, the rest of the line after the size. Returns 1 for anything
+# else, such as sub-prefix (PRE) lines. Spaces and tabs in the name are kept.
+parse_s3_ls_line() {
+  case "$1" in
+    [0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]\ [0-9][0-9]:[0-9][0-9]:[0-9][0-9]\ *) ;;
+    *) return 1 ;;
+  esac
+  _ls_rest=${1#???????????????????}
+  S3_LS_DATE=${1%"$_ls_rest"}
+  # The size is right-aligned, so drop the padding, the size and one space.
+  _ls_rest=${_ls_rest#"${_ls_rest%%[! ]*}"}
+  case "$_ls_rest" in
+    [0-9]*' '?*) S3_LS_NAME=${_ls_rest#* } ;;
+    *) return 1 ;;
+  esac
 }
 
 # Succeeds if file name $1 is a backup of POSTGRES_DATABASE as this image names

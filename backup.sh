@@ -44,6 +44,10 @@ if has_value "${DELETE_OLDER_THAN}"; then
   if ! older_than=$(date -d "$DELETE_OLDER_THAN" +%s 2>/dev/null); then
     die "DELETE_OLDER_THAN is not a valid date expression: ${DELETE_OLDER_THAN}"
   fi
+  # Everything is older than a time in the future, so it would delete every backup.
+  if [ "$older_than" -gt "$(date +%s)" ]; then
+    die "DELETE_OLDER_THAN is in the future: ${DELETE_OLDER_THAN}. Use a time in the past, such as '30 days ago'."
+  fi
 fi
 
 UPLOAD_ARGS=""
@@ -101,7 +105,7 @@ if [ "$USE_CUSTOM_FORMAT" = "yes" ]; then
     echo "ERROR: Custom format (-Fc) is not supported with pg_dumpall."
     exit 1
   else
-    pg_dump -Fc $POSTGRES_HOST_OPTS $POSTGRES_DUMP_OPTS "$POSTGRES_DATABASE" > "$SRC_FILE"
+    pg_dump -Fc $POSTGRES_HOST_OPTS $POSTGRES_DUMP_OPTS -d "$(conninfo_dbname "$POSTGRES_DATABASE")" > "$SRC_FILE"
   fi
 else
   SRC_FILE="$WORK_DIR/dump.sql.gz"
@@ -111,7 +115,7 @@ else
   if [ "${POSTGRES_DATABASE}" = "all" ]; then
     pg_dumpall $POSTGRES_HOST_OPTS $POSTGRES_DUMP_OPTS | $COMPRESSION_CMD > "$SRC_FILE"
   else
-    pg_dump $POSTGRES_HOST_OPTS $POSTGRES_DUMP_OPTS "$POSTGRES_DATABASE" | $COMPRESSION_CMD > "$SRC_FILE"
+    pg_dump $POSTGRES_HOST_OPTS $POSTGRES_DUMP_OPTS -d "$(conninfo_dbname "$POSTGRES_DATABASE")" | $COMPRESSION_CMD > "$SRC_FILE"
   fi
 fi
 
@@ -142,19 +146,14 @@ if has_value "${DELETE_OLDER_THAN}"; then
   kept=0
   while IFS= read -r line
     do
-      [ -n "$line" ] || continue
-      case "$line" in
-        *' PRE '*) continue ;;
-      esac
-      fileName=$(echo "$line" | awk '{ $1=$2=$3=""; sub(/^ +/, ""); print }')
-      [ -n "$fileName" ] || continue
+      parse_s3_ls_line "$line" || continue
+      fileName=$S3_LS_NAME
       # Never delete the backup this run just uploaded.
       [ "$fileName" != "$DEST_FILE" ] || continue
       if [ "${DELETE_MATCH_DATABASE}" = "yes" ] && ! is_database_backup "$fileName"; then
         continue
       fi
-      created=$(echo "$line" | awk '{print $1" "$2}')
-      created=$(date -d "$created" +%s)
+      created=$(date -d "$S3_LS_DATE" +%s)
       if [ "$created" -lt "$older_than" ]; then
         >&2 echo "DELETING ${fileName}"
         if ! aws $AWS_ARGS s3 rm "${S3_BASE_URI}${fileName}"; then

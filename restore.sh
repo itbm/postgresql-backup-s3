@@ -40,6 +40,7 @@ setup_aws
 setup_postgres
 POSTGRES_DATABASE_IDENT=$(quote_ident "$POSTGRES_DATABASE")
 POSTGRES_DATABASE_LITERAL=$(quote_literal "$POSTGRES_DATABASE")
+POSTGRES_DATABASE_CONNINFO=$(conninfo_dbname "$POSTGRES_DATABASE")
 
 PSQL_RESTORE_OPTS=""
 if [ "$RESTORE_ON_ERROR_STOP" = "yes" ]; then
@@ -87,10 +88,8 @@ resolve_latest_backup() {
   aws $AWS_ARGS s3 ls "$S3_BASE_URI" > "$WORK_DIR/s3-listing" || exit 2
   latest=""
   while IFS= read -r line; do
-    case "$line" in
-      *' PRE '*|'') continue ;;
-    esac
-    name=$(echo "$line" | awk '{ $1=$2=$3=""; sub(/^ +/, ""); print }')
+    parse_s3_ls_line "$line" || continue
+    name=$S3_LS_NAME
     is_database_backup "$name" || continue
     echo "$name" >> "$WORK_DIR/candidates"
   done < "$WORK_DIR/s3-listing"
@@ -105,6 +104,40 @@ resolve_latest_backup() {
   BACKUP_FILE="${S3_PREFIX_PATH:+${S3_PREFIX_PATH}/}${latest}"
   export BACKUP_FILE
   echo "Latest backup is ${BACKUP_FILE}"
+}
+
+# AES-CBC has no integrity check, so a wrong password or key derivation
+# decrypts without an error about 1 time in 256 and gives garbage. Accepts a
+# decrypted file only if it reads as a backup, and keeps the reason if not.
+decrypted_backup_readable() {
+  case "$DECRYPTED_PATH" in
+    *.dump) pg_restore --list "$DECRYPTED_PATH" >/dev/null 2> "$WORK_DIR/decrypt-check.err" ;;
+    *.sql.gz) $DECOMPRESSION_CMD "$DECRYPTED_PATH" >/dev/null 2> "$WORK_DIR/decrypt-check.err" ;;
+    # Any other name is rejected as an unsupported format after decryption.
+    *) return 0 ;;
+  esac
+}
+
+# Runs pg_restore with the given arguments. pg_restore 17 and later set
+# transaction_timeout on each connection, which PostgreSQL 16 and older reject;
+# pg_restore carries on and exits 1 at the end. A restore whose only errors are
+# that setting succeeded, unless pg_restore stopped at the first one
+# (--single-transaction), in which case it does not report errors as ignored.
+run_pg_restore() {
+  _rc=0
+  # Show pg_restore's messages as they come and keep a copy to check.
+  { { pg_restore "$@" 2>&1 1>&3 | tee "$WORK_DIR/pg_restore.err" >&2; } 3>&1; } || _rc=$?
+  if [ "$_rc" -ne 1 ]; then
+    return "$_rc"
+  fi
+  _errors=$(grep -c '^pg_restore: error: ' "$WORK_DIR/pg_restore.err" || true)
+  _timeouts=$(grep -c '^Command was: SET transaction_timeout = 0;$' "$WORK_DIR/pg_restore.err" || true)
+  if [ "$_timeouts" -gt 0 ] && [ "$_errors" -eq "$_timeouts" ] \
+    && grep -q '^pg_restore: warning: errors ignored on restore: ' "$WORK_DIR/pg_restore.err"; then
+    echo "Ignored ${_errors} error(s) from SET transaction_timeout, which this PostgreSQL server does not support"
+    return 0
+  fi
+  return "$_rc"
 }
 
 restore_on_exit() {
@@ -131,7 +164,8 @@ if [ "$BACKUP_FILE" = "latest" ]; then
   resolve_latest_backup
 fi
 
-LOCAL_FILE=$(basename "$BACKUP_FILE")
+# Not basename, which would read a name starting with "-" as options.
+LOCAL_FILE=${BACKUP_FILE##*/}
 DOWNLOAD_PATH="$WORK_DIR/$LOCAL_FILE"
 
 run_hooks pre-restore
@@ -150,12 +184,19 @@ case "$LOCAL_FILE" in
     ENCRYPTED_PATH="$DOWNLOAD_PATH"
     DECRYPTED_PATH="${DOWNLOAD_PATH%.enc}"
     # Prefer PBKDF2 (current format); fall back to legacy OpenSSL key derivation.
-    if ! openssl enc -aes-256-cbc -d -pbkdf2 -iter 100000 -in "$ENCRYPTED_PATH" -out "$DECRYPTED_PATH" -pass env:ENCRYPTION_PASSWORD 2>/dev/null; then
-      if ! openssl enc -aes-256-cbc -d -in "$ENCRYPTED_PATH" -out "$DECRYPTED_PATH" -pass env:ENCRYPTION_PASSWORD; then
-        echo "Error decrypting backup file. Check your encryption password."
-        exit 1
-      fi
+    if openssl enc -aes-256-cbc -d -pbkdf2 -iter 100000 -in "$ENCRYPTED_PATH" -out "$DECRYPTED_PATH" -pass env:ENCRYPTION_PASSWORD 2>/dev/null \
+      && decrypted_backup_readable; then
+      :
+    elif openssl enc -aes-256-cbc -d -in "$ENCRYPTED_PATH" -out "$DECRYPTED_PATH" -pass env:ENCRYPTION_PASSWORD \
+      && decrypted_backup_readable; then
       echo "WARNING: Decrypted legacy OpenSSL backup (non-PBKDF2). Re-backup to upgrade encryption."
+    else
+      echo "Error decrypting backup file. Check your encryption password."
+      if [ -s "$WORK_DIR/decrypt-check.err" ]; then
+        echo "A decryption passed OpenSSL's check but is not a readable backup:"
+        cat "$WORK_DIR/decrypt-check.err"
+      fi
+      exit 1
     fi
     rm -f "$ENCRYPTED_PATH"
     DOWNLOAD_PATH=$DECRYPTED_PATH
@@ -215,8 +256,8 @@ case "$DOWNLOAD_PATH" in
       plain_sql "$version" | psql $POSTGRES_HOST_OPTS $PSQL_RESTORE_OPTS -d postgres
     else
       echo "Restoring database ${POSTGRES_DATABASE}"
-      version=$(server_version_num "$POSTGRES_DATABASE")
-      plain_sql "$version" | psql $POSTGRES_HOST_OPTS $PSQL_RESTORE_OPTS -d "$POSTGRES_DATABASE"
+      version=$(server_version_num "$POSTGRES_DATABASE_CONNINFO")
+      plain_sql "$version" | psql $POSTGRES_HOST_OPTS $PSQL_RESTORE_OPTS -d "$POSTGRES_DATABASE_CONNINFO"
     fi
     ;;
   *.dump)
@@ -227,9 +268,9 @@ case "$DOWNLOAD_PATH" in
     echo "Restoring database ${POSTGRES_DATABASE} from custom format"
     if [ "$PARALLEL_JOBS" -gt 1 ]; then
       echo "Using parallel restore with $PARALLEL_JOBS jobs"
-      pg_restore -j "$PARALLEL_JOBS" $POSTGRES_HOST_OPTS -d "$POSTGRES_DATABASE" "$DOWNLOAD_PATH"
+      run_pg_restore -j "$PARALLEL_JOBS" $POSTGRES_HOST_OPTS -d "$POSTGRES_DATABASE_CONNINFO" "$DOWNLOAD_PATH"
     else
-      pg_restore $POSTGRES_HOST_OPTS -d "$POSTGRES_DATABASE" "$DOWNLOAD_PATH"
+      run_pg_restore $POSTGRES_HOST_OPTS -d "$POSTGRES_DATABASE_CONNINFO" "$DOWNLOAD_PATH"
     fi
     ;;
 esac

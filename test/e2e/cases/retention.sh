@@ -330,7 +330,6 @@ test_retention_keys_differing_only_in_whitespace() {
   _ret_wait_past "$cutoff"
   _ret_put "$bucket" backup/lead.sql.gz "backup/two spaces.sql.gz" "backup/tab x.sql.gz" backup/trail.sql.gz
 
-  xfail "retention rebuilds each key from 'aws s3 ls' with awk field splitting, which drops leading and trailing spaces and turns tabs and runs of spaces into one space: the old key stays and a newer object with the rebuilt name is deleted instead"
   bk_backup backup "$db" "$bucket" -e "DELETE_OLDER_THAN=@$cutoff"
   assert_rc 0 "backup with DELETE_OLDER_THAN"
   _ret_list "$bucket"
@@ -345,7 +344,6 @@ test_retention_deletes_file_whose_name_contains_pre() {
   db=$(new_db) || exit 1
   _ret_wait_past "$cutoff"
 
-  xfail "retention skips every 'aws s3 ls' line containing ' PRE ' to ignore sub-prefixes, so an old file whose name contains ' PRE ' is never deleted"
   bk_backup backup "$db" "$bucket" -e "DELETE_OLDER_THAN=@$cutoff"
   assert_rc 0 "backup with DELETE_OLDER_THAN"
   _ret_list "$bucket"
@@ -542,4 +540,21 @@ test_retention_future_threshold_keeps_new_backup() {
     _ret_list "$bucket"
     _ret_new_backup backup "$db" >/dev/null || exit 1
   fi
+}
+
+# Every file is older than a time in the future, so such a value is rejected.
+test_retention_future_threshold_deletes_nothing() {
+  bucket=$(new_bucket) || exit 1
+  _ret_put "$bucket" backup/old.sql.gz
+  db=$(new_db) || exit 1
+  hooks_setup
+  write_hook post-backup
+
+  bk_backup backup "$db" "$bucket" -e "DELETE_OLDER_THAN=7 days" "${HOOK_MOUNTS[@]}"
+  assert_rc_nonzero "backup with DELETE_OLDER_THAN='7 days'"
+  assert_log_not_contains "DELETING"
+  assert_log_not_contains "SQL backup finished"
+  assert_eq "$(hook_events)" "" "post-backup hook ran although DELETE_OLDER_THAN is in the future"
+  _ret_list "$bucket"
+  _ret_kept backup/old.sql.gz
 }

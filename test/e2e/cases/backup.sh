@@ -404,7 +404,6 @@ test_backup_postgres_user_with_space() {
   psql_exec postgres "CREATE ROLE $(sql_ident "$role") LOGIN SUPERUSER PASSWORD 'bk-space-role-pw'" >/dev/null \
     || fail "could not create role $role"
 
-  xfail "backup.sh expands POSTGRES_USER unquoted (-U \$POSTGRES_USER), so a role name containing a space breaks the pg_dump command line"
   bk_backup backup "$db" "$bucket" -e "POSTGRES_USER=$role" -e POSTGRES_PASSWORD=bk-space-role-pw
   assert_rc 0 "backup as role '$role'"
   key=$(s3_single_key "$bucket" backup/) || exit 1
@@ -583,7 +582,6 @@ test_backup_database_name_starting_with_hyphen() {
   name="-d$decoy"
   new_db_named "$name"
 
-  xfail "backup.sh passes POSTGRES_DATABASE to pg_dump as a bare argument, so a name starting with '-' is parsed as options (-d<rest> dumps database <rest>)"
   bk_backup backup "$name" "$bucket"
   assert_rc 0 "backup of database '$name'"
   key=$(s3_single_key "$bucket" "backup/${name}_") || exit 1
@@ -597,7 +595,6 @@ test_backup_database_name_with_equals_sign() {
   name="$(printf 't_%s' "$CASE_SLUG" | tr '-' '_' | cut -c1-40)_a=b"
   new_db_named "$name"
 
-  xfail "backup.sh passes POSTGRES_DATABASE to pg_dump as a bare argument, so a name containing '=' is parsed as a connection string"
   bk_backup backup "$name" "$bucket"
   assert_rc 0 "backup of database '$name'"
   key=$(s3_single_key "$bucket" "backup/${name}_") || exit 1
