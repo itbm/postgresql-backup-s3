@@ -203,7 +203,6 @@ test_s3_prefix_trailing_slash_uploads_to_single_slash_key() {
   write_hook post-backup
   _s3_trace_start "$bucket"
 
-  xfail "S3_PREFIX=backups/ uploads to s3://<bucket>/backups//<file>: MinIO rejects that key (XMinioInvalidObjectName) and the backup exits 2, AWS S3 would store a key containing '//'"
   bk_backup backup "$db" "$bucket" -e S3_PREFIX=backups/ "${HOOK_MOUNTS[@]}"
   assert_rc 0 "backup with S3_PREFIX=backups/"
   key=$(s3_single_key "$bucket" "") || exit 1
@@ -221,7 +220,6 @@ test_s3_prefix_trailing_slash_retention_deletes_old_backups() {
   cutoff=$(_s3_cutoff) || exit 1
   _s3_trace_start "$bucket"
 
-  xfail "S3_PREFIX=backups/ uploads to s3://<bucket>/backups//<file>, which MinIO rejects (XMinioInvalidObjectName), so the backup exits 2 before retention; retention would list and delete under backups// too"
   bk_backup backup "$db" "$bucket" -e S3_PREFIX=backups/ -e "DELETE_OLDER_THAN=@$cutoff"
   assert_rc 0 "backup with S3_PREFIX=backups/ and DELETE_OLDER_THAN"
   assert_s3_absent "$bucket" backups/old.sql.gz "old backup under backups/ was not deleted"
@@ -235,7 +233,6 @@ test_s3_prefix_trailing_slash_backup_restores() {
   db=$(new_db) || exit 1
   bucket=$(new_bucket) || exit 1
 
-  xfail "S3_PREFIX=backups/ uploads to s3://<bucket>/backups//<file>, which MinIO rejects (XMinioInvalidObjectName), so the backup exits 2 and there is nothing to restore"
   bk_backup backup "$db" "$bucket" -e S3_PREFIX=backups/
   assert_rc 0 "backup with S3_PREFIX=backups/"
   key=$(s3_single_key "$bucket" "") || exit 1
@@ -259,7 +256,6 @@ test_s3_prefix_leading_slash_uploads_to_single_slash_key() {
   key=$(s3_single_key "$bucket" "") || exit 1
   assert_match "$key" "^backups/${db}_${_S3_TS_RE}\.sql\.gz\$" "key with S3_PREFIX=/backups"
   _s3_trace_sync
-  xfail "S3_PREFIX=/backups uploads to s3://<bucket>//backups/<file>, which on AWS S3 is a key starting with '/' (MinIO hides it by normalising the key); BACKUP_S3_URI has the same '//'"
   _s3_assert_cli_keys "$bucket" PUT "backups/${db}_" "upload with S3_PREFIX=/backups"
   assert_eq "$(_s3_env_value "$CASE_DIR/hook-out/post-backup.env" BACKUP_S3_URI)" "s3://$bucket/$key" \
     "BACKUP_S3_URI with S3_PREFIX=/backups"
@@ -272,7 +268,6 @@ test_s3_prefix_leading_slash_retention_deletes_old_backups() {
   cutoff=$(_s3_cutoff) || exit 1
   _s3_trace_start "$bucket"
 
-  xfail "with S3_PREFIX=/backups the retention listing is 'aws s3 ls s3://<bucket>//backups/', which matches nothing, so the backup exits 2 after uploading and nothing is deleted"
   bk_backup backup "$db" "$bucket" -e S3_PREFIX=/backups -e "DELETE_OLDER_THAN=@$cutoff"
   assert_rc 0 "backup with S3_PREFIX=/backups and DELETE_OLDER_THAN"
   assert_s3_absent "$bucket" backups/old.sql.gz "old backup under backups/ was not deleted"
@@ -311,7 +306,6 @@ test_s3_prefix_empty_uploads_without_leading_slash() {
   key=$(s3_single_key "$bucket" "") || exit 1
   assert_match "$key" "^${db}_${_S3_TS_RE}\.sql\.gz\$" "key with an empty prefix"
   _s3_trace_sync
-  xfail "an empty S3_PREFIX uploads to s3://<bucket>//<file>, which on AWS S3 is a key starting with '/' (MinIO hides it by normalising the key); BACKUP_S3_URI has the same '//'"
   _s3_assert_cli_keys "$bucket" PUT "${db}_" "upload with an empty S3_PREFIX"
   assert_eq "$(_s3_env_value "$CASE_DIR/hook-out/post-backup.env" BACKUP_S3_URI)" "s3://$bucket/$key" \
     "BACKUP_S3_URI with an empty prefix"
@@ -342,7 +336,6 @@ test_s3_prefix_empty_retention_deletes_old_backups() {
   cutoff=$(_s3_cutoff) || exit 1
   _s3_trace_start "$bucket"
 
-  xfail "with an empty S3_PREFIX the retention listing is 'aws s3 ls s3://<bucket>//', which matches nothing, so the backup exits 2 after uploading and nothing is deleted"
   bk_backup second "$db" "$bucket" -e S3_PREFIX= -e "DELETE_OLDER_THAN=@$cutoff"
   assert_rc 0 "backup with an empty S3_PREFIX and DELETE_OLDER_THAN"
   assert_log_contains "SQL backup finished"

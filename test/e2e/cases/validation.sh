@@ -322,7 +322,6 @@ test_validation_hook_cannot_redirect_root_temp_files() {
   write_hook pre-backup '#!/bin/sh
 ln -s /etc/motd /tmp/dump.sql.gz.enc && ln -s /etc/issue /tmp/s3-listing && echo planted >>/hook-out/events'
 
-  xfail "backup.sh writes /tmp/dump.sql.gz.enc and /tmp/s3-listing as root without removing what is already there, so symlinks planted by a pre-backup hook make root overwrite any file"
   bk_backup backup "$db" "$bucket" "${HOOK_MOUNTS[@]}" -e ENCRYPTION_PASSWORD=e2e-secret \
     -e "DELETE_OLDER_THAN=1 day ago" -- sh -c '
       before=$(md5sum /etc/motd /etc/issue)
@@ -419,7 +418,6 @@ test_validation_restore_script_rejects_empty_backup_file() {
   bucket=$(new_bucket) || exit 1
   _val_hooks_all
 
-  xfail "restore.sh only rejects BACKUP_FILE=**None**: an empty value downloads s3://<bucket>/, drops the database when DROP_DATABASE=yes, then fails with 'Unsupported backup format'"
   bk_run direct -e "POSTGRES_DATABASE=$db" -e "S3_BUCKET=$bucket" -e BACKUP_FILE= -e DROP_DATABASE=yes \
     "${VAL_HOOK_ARGS[@]}" -- sh restore.sh
   db_exists "$db" || fail "restore.sh with an empty BACKUP_FILE dropped $db"
@@ -641,7 +639,6 @@ test_validation_empty_schedule_runs_one_backup() {
   db=$(new_db) || exit 1
   bucket=$(new_bucket) || exit 1
 
-  xfail "an empty SCHEDULE (as in README.md's Kubernetes example) is passed to go-cron, which exits 1 with 'Invalid schedule format: empty spec string' and no backup"
   bk_start run -e "POSTGRES_DATABASE=$db" -e "S3_BUCKET=$bucket" -e SCHEDULE=
   _val_wait_exit 120
   assert_rc 0 "run with an empty SCHEDULE"
@@ -654,7 +651,6 @@ test_validation_empty_postgres_port_uses_default() {
   db=$(new_db) || exit 1
   bucket=$(new_bucket) || exit 1
 
-  xfail "an empty POSTGRES_PORT (as in README.md's Kubernetes example) leaves a bare '-p' that takes '-U' as the port, so pg_dump fails with 'too many command-line arguments'"
   bk_backup backup "$db" "$bucket" -e POSTGRES_PORT=
   assert_rc 0 "backup with an empty POSTGRES_PORT"
   key=$(s3_single_key "$bucket" backup/) || exit 1
@@ -668,7 +664,6 @@ test_validation_empty_s3_endpoint_same_as_unset() {
   db=$(new_db) || exit 1
   bucket=$(new_bucket) || exit 1
 
-  xfail "an empty S3_ENDPOINT (as in README.md's Kubernetes example) becomes a bare '--endpoint-url' that takes 's3' as the URL, so every aws call fails with \"Found invalid choice 'cp'\" and the backup exits 2"
   # AWS_ENDPOINT_URL stands in for AWS's own endpoint, which the suite cannot reach.
   bk_backup backup "$db" "$bucket" --unset S3_ENDPOINT -e S3_ENDPOINT= -e AWS_ENDPOINT_URL=http://minio:9000
   assert_rc 0 "backup with an empty S3_ENDPOINT"
@@ -681,7 +676,6 @@ test_validation_empty_delete_older_than_deletes_nothing() {
   bucket=$(new_bucket) || exit 1
   _val_put_aged "$bucket" backup/older.sql.gz "3 days ago"
 
-  xfail "an empty DELETE_OLDER_THAN reaches 'date -d \"\"', which is midnight today, so every object in the prefix older than that is deleted"
   bk_backup backup "$db" "$bucket" -e DELETE_OLDER_THAN=
   assert_s3_exists "$bucket" backup/older.sql.gz "an empty DELETE_OLDER_THAN deleted an older object"
   assert_log_not_contains "DELETING"
@@ -693,7 +687,6 @@ test_validation_empty_encryption_password_never_used_as_key() {
   db=$(new_db) || exit 1
   bucket=$(new_bucket) || exit 1
 
-  xfail "an empty ENCRYPTION_PASSWORD is used as the key: the backup is uploaded as .sql.gz.enc, encrypted with an empty password that anyone can supply"
   bk_backup backup "$db" "$bucket" -e ENCRYPTION_PASSWORD=
   assert_eq "$(s3_keys "$bucket" | grep '\.enc$')" "" "objects encrypted with an empty password"
   assert_log_not_contains "Encrypting "
@@ -742,7 +735,6 @@ test_validation_empty_decompression_cmd_uses_gunzip() {
 test_validation_empty_postgres_database_rejected_on_backup() {
   bucket=$(new_bucket) || exit 1
 
-  xfail "an empty POSTGRES_DATABASE passes validation (only **None** is checked), so pg_dump falls back to the database named after the user, uploads it as backup/_<timestamp>.sql.gz and exits 0"
   bk_run backup -e "S3_BUCKET=$bucket" -e POSTGRES_DATABASE=
   assert_s3_count "$bucket" "" 0 "objects uploaded with an empty POSTGRES_DATABASE"
   assert_rc 1 "backup with an empty POSTGRES_DATABASE"
@@ -758,7 +750,6 @@ test_validation_empty_postgres_database_rejected_on_restore() {
   assert_rc 0 "backup to restore from"
   key=$(s3_single_key "$bucket" backup/) || exit 1
 
-  xfail "an empty POSTGRES_DATABASE passes restore validation and 'psql -d \"\"' connects to the database named after the user, so the backup is loaded into the postgres maintenance database and the run reports success"
   bk_restore restore "" "$bucket" "$key" --unset POSTGRES_HOST -e POSTGRES_HOST=valblank -e CREATE_DATABASE=yes
   assert_eq "$(_val_sql "$ctr" 5432 postgres "SELECT count(*) FROM pg_namespace WHERE nspname = 'app'")" 0 \
     "backup restored into the postgres database"
@@ -769,24 +760,20 @@ test_validation_empty_postgres_database_rejected_on_restore() {
 
 test_validation_empty_s3_bucket_rejected() {
   _val_blank_setup
-  xfail "an empty S3_BUCKET passes validation (only **None** is checked), so the pre-backup hooks run, the dump runs, the upload fails with 'Invalid bucket name \"\"' (exit 2) and the backup-error hooks fire"
   _val_blank_rejected S3_BUCKET
 }
 
 test_validation_empty_postgres_host_rejected() {
   _val_blank_setup
-  xfail "an empty POSTGRES_HOST passes validation (only **None** is checked), so the pre-backup hooks run, pg_dump takes '-p' as the host and fails with 'too many command-line arguments', and the backup-error hooks fire"
   _val_blank_rejected POSTGRES_HOST
 }
 
 test_validation_empty_postgres_user_rejected() {
   _val_blank_setup
-  xfail "an empty POSTGRES_USER passes validation (only **None** is checked), so the pre-backup hooks run, '-U' takes the next argument as the user name, pg_dump fails with 'password authentication failed' and the backup-error hooks fire"
   _val_blank_rejected POSTGRES_USER
 }
 
 test_validation_empty_postgres_password_rejected() {
   _val_blank_setup
-  xfail "an empty POSTGRES_PASSWORD passes validation (only **None** is checked), so the pre-backup hooks run, pg_dump fails with 'fe_sendauth: no password supplied' and the backup-error hooks fire"
   _val_blank_rejected POSTGRES_PASSWORD
 }

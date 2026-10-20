@@ -193,7 +193,6 @@ test_restore_plain_into_populated_database_fails() {
   # Already holds every object in the backup, so its SQL cannot apply.
   target=$(new_db target) || exit 1
 
-  xfail "plain restores of one database run psql without ON_ERROR_STOP, so SQL errors are ignored and the restore reports success"
   bk_restore restore "$target" "$bucket" "$key"
   assert_rc_nonzero "plain restore into a database that already holds the backup's objects"
   assert_log_contains "already exists"
@@ -306,7 +305,6 @@ test_restore_failed_drop_fails_restore() {
   psql_exec "$target" "CREATE TABLE public.rst_marker (v text); INSERT INTO public.rst_marker VALUES ('kept');
     GRANT CREATE ON DATABASE $(sql_ident "$target") TO $role" >/dev/null || fail "could not prepare $target"
 
-  xfail "a failed DROP_DATABASE only prints a warning, and the restore carries on into the existing database"
   bk_restore restore "$target" "$bucket" "$key" --unset POSTGRES_USER --unset POSTGRES_PASSWORD \
     -e "POSTGRES_USER=$role" -e "POSTGRES_PASSWORD=$role_pw" -e DROP_DATABASE=yes -e CREATE_DATABASE=yes
   assert_rc_nonzero "restore after DROP_DATABASE failed"
@@ -606,7 +604,6 @@ test_restore_unsupported_format_does_not_drop_database() {
   bucket=$(new_bucket) || exit 1
   s3_put_string "$bucket" "backup/${db}.sql" "SELECT 1;"
 
-  xfail "DROP_DATABASE runs before the format check, so an unsupported file name drops the database and restores nothing"
   bk_restore restore "$db" "$bucket" "backup/${db}.sql" -e DROP_DATABASE=yes -e CREATE_DATABASE=yes
   assert_rc 1 "unsupported backup file with DROP_DATABASE=yes"
   assert_log_contains "Unsupported backup format"
