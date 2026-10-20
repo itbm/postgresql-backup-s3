@@ -139,9 +139,11 @@ _val_put_aged() {
       set -e
       sig="--aws-sigv4 aws:amz:us-east-1:s3"
       echo "old object" >/tmp/body
+      # One timestamp for both, so a second boundary between them cannot differ.
+      at=$(date -u -d "$VA_WHEN" +%s)
       curl -fsS -o /dev/null $sig --user "$VA_AUTH" -T /tmp/body \
-        -H "X-Minio-Source-Mtime: $(date -u -d "$VA_WHEN" +%Y-%m-%dT%H:%M:%SZ)" "$VA_URL"
-      want=$(date -u -d "$VA_WHEN" "+%a, %d %b %Y %H:%M:%S GMT")
+        -H "X-Minio-Source-Mtime: $(date -u -d "@$at" +%Y-%m-%dT%H:%M:%SZ)" "$VA_URL"
+      want=$(date -u -d "@$at" "+%a, %d %b %Y %H:%M:%S GMT")
       got=$(curl -fsSI $sig --user "$VA_AUTH" "$VA_URL" | tr -d "\r" | sed -n "s/^[Ll]ast-[Mm]odified: //p")
       [ "$got" = "$want" ] || exit 3
     '
