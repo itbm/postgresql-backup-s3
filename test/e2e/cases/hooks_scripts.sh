@@ -220,12 +220,17 @@ echo \"hs-sched-stderr from \$1\" >&2"
     bk_logs
     fail "two scheduled backups did not both fire post-backup (events: $(hook_events))"
   }
+  # Judge only the runs before the stop: stopping the container may land in
+  # a run and fail it, which may rightly fire backup-error.
+  events=$(hook_events)
   bk_stop 2
-  case "$(hook_events)" in
+  case "$events" in
     "pre-backup post-backup pre-backup post-backup"*) ;;
-    *) fail "unexpected scheduled hook events: $(hook_events)" ;;
+    *) fail "unexpected scheduled hook events: $events" ;;
   esac
-  assert_eq "$(_hs_count_event backup-error)" 0 "backup-error events"
+  case " $events " in
+    *" backup-error "*) fail "backup-error fired during successful scheduled runs: $events" ;;
+  esac
   assert_log_contains "Running script hook for post-backup"
   # The hook's own stdout and stderr must come through go-cron.
   assert_log_contains "hs-sched-stdout from post-backup"
@@ -292,20 +297,33 @@ test_hookscripts_env_is_scrubbed_on_error_events() {
   bucket=$(new_bucket)
   hooks_setup
   _hs_record $_HS_ALL_EVENTS
-
   # Credential-chain variables the image never reads itself; each must still
   # be kept away from hooks.
-  bk_restore restore "$db" "$bucket" "backup/missing.sql.gz.enc" "${HOOK_MOUNTS[@]}" \
-    -e "ENCRYPTION_PASSWORD=$_HS_ENC_PASSWORD" \
-    -e AWS_SESSION_TOKEN=hs-session-token-9a2c \
-    -e AWS_ROLE_ARN=arn:aws:iam::123456789012:role/hs-role-4b7e \
-    -e AWS_WEB_IDENTITY_TOKEN_FILE=/var/run/secrets/hs-token-3c8d \
-    -e AWS_CONTAINER_AUTHORIZATION_TOKEN=hs-container-token-5e1f
+  secrets=(-e "ENCRYPTION_PASSWORD=$_HS_ENC_PASSWORD"
+    -e AWS_SESSION_TOKEN=hs-session-token-9a2c
+    -e AWS_ROLE_ARN=arn:aws:iam::123456789012:role/hs-role-4b7e
+    -e AWS_WEB_IDENTITY_TOKEN_FILE=/var/run/secrets/hs-token-3c8d
+    -e AWS_CONTAINER_AUTHORIZATION_TOKEN=hs-container-token-5e1f)
+  values="$_HS_ENC_PASSWORD hs-session-token-9a2c hs-role-4b7e hs-token-3c8d hs-container-token-5e1f"
+
+  # S3 may reject the bogus session token before it notices the missing
+  # bucket; either way the upload fails.
+  bk_backup backup "$db" "${CASE_SLUG}-missing" "${HOOK_MOUNTS[@]}" "${secrets[@]}"
+  assert_rc 2 "encrypted backup to a missing bucket"
+  assert_eq "$(hook_events)" "pre-backup backup-error" "backup hook events"
+  for ev in pre-backup backup-error; do
+    # shellcheck disable=SC2086
+    _hs_assert_scrubbed "$ev" $values
+  done
+  _hs_assert_env backup-error HOOK_EXIT_CODE 2
+
+  rm -f "$CASE_DIR"/hook-out/*
+  bk_restore restore "$db" "$bucket" "backup/missing.sql.gz.enc" "${HOOK_MOUNTS[@]}" "${secrets[@]}"
   assert_rc 2 "restore of a missing object"
-  assert_eq "$(hook_events)" "pre-restore restore-error" "hook events"
+  assert_eq "$(hook_events)" "pre-restore restore-error" "restore hook events"
   for ev in pre-restore restore-error; do
-    _hs_assert_scrubbed "$ev" "$_HS_ENC_PASSWORD" hs-session-token-9a2c hs-role-4b7e \
-      hs-token-3c8d hs-container-token-5e1f
+    # shellcheck disable=SC2086
+    _hs_assert_scrubbed "$ev" $values
   done
   _hs_assert_env restore-error HOOK_EXIT_CODE 2
 }
@@ -367,7 +385,6 @@ test_hookscripts_inherit_env_passes_secrets() {
 }
 
 test_hookscripts_inherit_env_keeps_hook_event_and_exit_code() {
-  xfail "HOOK_INHERIT_ENV=yes drops HOOK_EVENT and HOOK_EXIT_CODE (set only in the env -i allowlist branch)"
   db=$(new_db)
   missing="${CASE_SLUG}-missing"
   hooks_setup
@@ -377,6 +394,7 @@ test_hookscripts_inherit_env_keeps_hook_event_and_exit_code() {
   assert_rc 2 "upload to a missing bucket"
   assert_eq "$(hook_events)" "pre-backup backup-error" "hook events"
   _hs_assert_env backup-error POSTGRES_PASSWORD "$PG_PASSWORD"
+  xfail "HOOK_INHERIT_ENV=yes drops HOOK_EVENT and HOOK_EXIT_CODE (set only in the env -i allowlist branch)"
   _hs_assert_env pre-backup HOOK_EVENT pre-backup
   _hs_assert_env backup-error HOOK_EVENT backup-error
   _hs_assert_env backup-error HOOK_EXIT_CODE 2
@@ -557,6 +575,24 @@ test_hookscripts_non_executable_hook_fails_closed() {
   assert_log_contains "ERROR: hook script for pre-backup is not an executable regular file"
   assert_log_not_contains "Creating dump of"
   assert_eq "$(hook_events)" "backup-error" "hook events"
+  assert_s3_count "$bucket" "" 0
+}
+
+test_hookscripts_directory_hook_fails_closed() {
+  db=$(new_db)
+  bucket=$(new_bucket)
+  hooks_setup
+  _hs_record post-backup backup-error
+  # A directory passes an executable-bit check, so only a regular-file check
+  # keeps it from being taken for the pre-backup script.
+  mkdir -p "$CASE_DIR/hooks/pre-backup"
+  chmod 755 "$CASE_DIR/hooks/pre-backup"
+
+  bk_backup backup "$db" "$bucket" "${HOOK_MOUNTS[@]}"
+  assert_rc_nonzero "backup with a directory as the pre-backup hook"
+  assert_log_contains "not an executable regular file"
+  assert_eq "$(hook_events)" "backup-error" "hook events"
+  _hs_assert_env backup-error HOOK_EXIT_CODE "$BK_RC"
   assert_s3_count "$bucket" "" 0
 }
 
