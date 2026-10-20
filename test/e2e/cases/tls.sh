@@ -143,6 +143,55 @@ _tls_log_has_at_least() {
   [ "$(_tls_log_count "$1")" -ge "$2" ]
 }
 
+# _tls_make_ca <name> - writes a fresh self-signed CA, unrelated to minio-tls,
+# to CASE_DIR/<name>.crt.
+_tls_make_ca() {
+  docker run --rm -v "$CASE_DIR:/out" --entrypoint openssl "$E2E_IMAGE" req -x509 -newkey rsa:2048 \
+    -nodes -days 1 -subj "/CN=$1" -keyout "/out/$1.key" -out "/out/$1.crt" >/dev/null 2>&1 \
+    || fail "could not create CA $1"
+}
+
+# _tls_assert_system_bundle_has <what> <cert>... - the system CA bundle the last
+# container ended with still holds every root the image ships with (public S3
+# endpoints and hook URLs need them) plus each given certificate.
+_tls_assert_system_bundle_has() {
+  _sbh_what=$1
+  shift
+  docker run --rm --entrypoint cat "$E2E_IMAGE" /etc/ssl/certs/ca-certificates.crt >"$CASE_DIR/roots-image.pem" \
+    || fail "could not read the image's own CA bundle"
+  docker cp -L "$BK_CTR:/etc/ssl/certs/ca-certificates.crt" "$CASE_DIR/roots-used.pem" >/dev/null 2>&1 \
+    || fail "could not copy the CA bundle out of $BK_CTR"
+  for _sbh_pem in "$CASE_DIR/roots-image.pem" "$@"; do
+    grep -q -- '-----BEGIN CERTIFICATE-----' "$_sbh_pem" || fail "no certificate in $_sbh_pem"
+    # Compares the base64 lines, so the check does not depend on how certificates are labelled.
+    _sbh_missing=$(grep -E '^[A-Za-z0-9+/=]+$' "$_sbh_pem" | grep -Fxvf "$CASE_DIR/roots-used.pem" | grep -c . || true)
+    [ "$_sbh_missing" = 0 ] \
+      || fail "$_sbh_what: $(basename "$_sbh_pem") is missing from the system CA bundle ($_sbh_missing lines)"
+  done
+}
+
+# _tls_scheduled <what> [bk_run options...] - SCHEDULE mode against minio-tls
+# with the given trust options. run.sh sets up trust once, before handing over
+# to go-cron, so every scheduled run has to inherit it.
+_tls_scheduled() {
+  _ts_what=$1
+  shift
+  _ts_db=$(_tls_db) || exit 1
+  _ts_bucket=$(_tls_bucket) || exit 1
+
+  bk_start cron -e "POSTGRES_DATABASE=$_ts_db" -e "S3_BUCKET=$_ts_bucket" --unset S3_ENDPOINT \
+    -e "S3_ENDPOINT=$_TLS_ENDPOINT" -e "SCHEDULE=@every 2s" "$@"
+  wait_for 90 _tls_log_has_at_least "Command finished" 2 \
+    || fail "$_ts_what: fewer than 2 scheduled runs finished within 90s"
+  assert_log_not_contains "SSL validation failed" "$_ts_what"
+  assert_log_not_contains "Command finished with error" "$_ts_what"
+  assert_log_contains "Command finished successfully" "$_ts_what"
+  bk_stop
+
+  _ts_n=$(_tls_count "$_ts_bucket" backup/)
+  [ "$_ts_n" -ge 2 ] || fail "$_ts_what: expected at least 2 backups in s3://$_ts_bucket/backup/, got $_ts_n"
+}
+
 # ---------------------------------------------------------------------------
 # Verification is on by default.
 
@@ -183,6 +232,13 @@ test_tls_no_ca_restore_rejected_before_touching_database() {
     fail "restore created $restored although the download was rejected"
   fi
   assert_eq "$(bk_tmp_leftovers)" "" "temporary files left in /tmp after the rejected download"
+
+  # An existing database has to survive a rejected download, even with DROP_DATABASE=yes.
+  _tls_restore restore-existing "$db" "$bucket" "$key" -e DROP_DATABASE=yes -e CREATE_DATABASE=yes
+  assert_rc 2 "restore over an existing database with DROP_DATABASE=yes and no CA configured"
+  assert_log_contains "CERTIFICATE_VERIFY_FAILED"
+  db_exists "$db" || fail "a restore whose download was rejected dropped $db"
+  assert_same_data e2e_seed "$db"
 }
 
 # ---------------------------------------------------------------------------
@@ -207,22 +263,32 @@ test_tls_ca_bundle_accepts_multi_cert_bundle_at_path_with_space() {
   _tls_backup_key "$db" "$bucket" >/dev/null || exit 1
 }
 
+test_tls_ca_bundle_scheduled_backups() {
+  _tls_begin
+  _tls_scheduled "scheduled backups with S3_CA_BUNDLE" \
+    -e S3_CA_BUNDLE=/certs/ca.crt -v "$E2E_CERTS/ca.crt:/certs/ca.crt:ro"
+}
+
 test_tls_system_ca_dir_backup_and_restore() {
   _tls_begin
   _tls_roundtrip "the CA mounted in $_TLS_SYS_DIR" -v "$(e2e_ca_system_mount)"
 }
 
-test_tls_system_ca_dir_trusts_every_crt_file() {
+test_tls_system_ca_dir_adds_every_crt_file_to_system_roots() {
   _tls_begin
   db=$(_tls_db) || exit 1
   bucket=$(_tls_bucket) || exit 1
+  _tls_make_ca unrelated-2
 
-  # Two files, the right one sorting last.
+  # The right CA sorts in the middle, so trusting only the first or the last file fails.
   _tls_backup backup "$db" "$bucket" \
     -v "$E2E_CERTS/other-ca.crt:$_TLS_SYS_DIR/a-unrelated.crt:ro" \
-    -v "$E2E_CERTS/ca.crt:$_TLS_SYS_DIR/z-e2e.crt:ro"
-  _tls_assert_backup_ok "backup with two CA files mounted in $_TLS_SYS_DIR"
+    -v "$E2E_CERTS/ca.crt:$_TLS_SYS_DIR/m-e2e.crt:ro" \
+    -v "$CASE_DIR/unrelated-2.crt:$_TLS_SYS_DIR/z-unrelated.crt:ro"
+  _tls_assert_backup_ok "backup with three CA files mounted in $_TLS_SYS_DIR"
   _tls_backup_key "$db" "$bucket" >/dev/null || exit 1
+  _tls_assert_system_bundle_has "after mounting three CAs in $_TLS_SYS_DIR" \
+    "$E2E_CERTS/other-ca.crt" "$E2E_CERTS/ca.crt" "$CASE_DIR/unrelated-2.crt"
 }
 
 test_tls_system_ca_dir_ignores_file_without_crt_suffix() {
@@ -236,21 +302,7 @@ test_tls_system_ca_dir_ignores_file_without_crt_suffix() {
 
 test_tls_system_ca_dir_scheduled_backups() {
   _tls_begin
-  db=$(_tls_db) || exit 1
-  bucket=$(_tls_bucket) || exit 1
-
-  # run.sh sets up the trust store once, before handing over to go-cron.
-  bk_start cron -e "POSTGRES_DATABASE=$db" -e "S3_BUCKET=$bucket" --unset S3_ENDPOINT \
-    -e "S3_ENDPOINT=$_TLS_ENDPOINT" -e "SCHEDULE=@every 2s" -v "$(e2e_ca_system_mount)"
-  wait_for 90 _tls_log_has_at_least "Command finished" 2 \
-    || fail "fewer than 2 scheduled runs finished within 90s"
-  assert_log_not_contains "SSL validation failed"
-  assert_log_not_contains "Command finished with error"
-  assert_log_contains "Command finished successfully"
-  bk_stop
-
-  n=$(_tls_count "$bucket" backup/)
-  [ "$n" -ge 2 ] || fail "expected at least 2 scheduled backups in s3://$bucket/backup/, got $n"
+  _tls_scheduled "scheduled backups with the CA mounted in $_TLS_SYS_DIR" -v "$(e2e_ca_system_mount)"
 }
 
 test_tls_aws_ca_bundle_backup_and_restore() {
