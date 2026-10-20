@@ -245,3 +245,12 @@ URL hooks are HTTPS GET requests with no body and no secret headers. URLs are no
 `pre-*` and `post-*` hooks fail closed: a hook failure fails the job. Error hooks are best-effort so they cannot hide the original backup or restore exit code. Validation errors (missing `S3_BUCKET`, and similar) occur before hooks are armed and do not fire `*-error` URLs.
 
 Missing env vars and `**None**` leave current behaviour unchanged: no hooks run.
+
+## Testing
+
+```sh
+$ sh test/hooks_test.sh   # unit tests for hook handling, no Docker needed
+$ test/e2e/run.sh         # builds the image and runs it against PostgreSQL 18 and MinIO
+```
+
+The end-to-end tests need only bash and Docker. See [test/e2e/README.md](test/e2e/README.md) for options and how to add a test. Both suites run on every pull request.
