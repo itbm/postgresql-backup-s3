@@ -536,7 +536,6 @@ test_retention_future_threshold_keeps_new_backup() {
   bucket=$(new_bucket) || exit 1
   db=$(new_db) || exit 1
 
-  xfail "a threshold in the future, such as '7 days' without 'ago', deletes the backup just uploaded (and everything else in the prefix) while the run exits 0 and reports success"
   bk_backup backup "$db" "$bucket" -e "DELETE_OLDER_THAN=7 days"
   assert_log_not_contains "DELETING ${db}_" "retention deleted the backup it had just uploaded"
   if [ "$BK_RC" = 0 ]; then

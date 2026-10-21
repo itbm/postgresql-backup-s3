@@ -333,7 +333,6 @@ test_schedule_timeout_kills_child_processes() {
 
   # At most the current run's pg_dump may be alive; allow a moment for a
   # graceful (SIGTERM, then SIGKILL) implementation to finish the job.
-  xfail "COMMAND_TIMEOUT kills only /bin/sh backup.sh; its pg_dump keeps running and timed-out runs pile up"
   if ! wait_for 10 _sched_live_procs_at_most pg_dump 1; then
     note "processes in $BK_CTR:"
     docker exec "$BK_CTR" ps -o pid,ppid,stat,args | sed 's/^/# /' >&2
@@ -368,7 +367,6 @@ while [ -e /hook-out/slow ]; do sleep 1; done'
   wait_for 60 _sched_log_has_at_least "timed out after 8s" 1 || fail "the run blocked in pg_dump was not timed out"
   assert_log_contains "Creating dump of $db database" "the first run did not reach pg_dump"
 
-  xfail "a run stopped by COMMAND_TIMEOUT is SIGKILLed: no backup-error hooks, and its dump is left in /tmp"
   # The recording hook writes backup-error.uid last, after its environment.
   wait_for 20 test -s "$CASE_DIR/hook-out/backup-error.uid" \
     || fail "backup-error hook did not run after the run in pg_dump timed out (events: $(hook_events))"
@@ -526,7 +524,6 @@ test_schedule_long_output_line_does_not_hang() {
 awk '\''BEGIN { for (i = 1; i <= 2500; i++) printf "Completed %d.0 KiB/600.0 MiB (150.0 MiB/s) with 1 file(s) remaining\r", i * 256; print "" }'\'''
 
   bk_start cron -e "POSTGRES_DATABASE=$db" -e "S3_BUCKET=$bucket" -e "SCHEDULE=@every 2s" "${HOOK_MOUNTS[@]}"
-  xfail "a scheduled run whose output has a line over 64 KiB (aws progress on a ~500 MB upload) hangs for ever"
   wait_for 30 s3_has_at_least "$bucket" backup/ 1 || { bk_logs; fail "no backup within 30s; the run is stuck"; }
   wait_for 30 _sched_log_has_at_least "Command finished successfully" 1 || fail "run never finished"
 }
@@ -544,7 +541,6 @@ echo end-of-post-backup-output'
 
   bk_start cron -e "POSTGRES_DATABASE=$db" -e "S3_BUCKET=$bucket" -e "SCHEDULE=@every 2s" "${HOOK_MOUNTS[@]}"
   wait_for 90 _sched_log_has_at_least "Command finished successfully" 2 || fail "fewer than 2 runs finished"
-  xfail "the end of a scheduled run's output is lost (cmd.Wait closes the pipes before they are drained)"
   finished=$(grep -Fc "Command finished successfully" "$BK_LOG")
   markers=$(grep -Fc "STDOUT: end-of-post-backup-output" "$BK_LOG" || true)
   [ "$markers" -ge "$finished" ] \
