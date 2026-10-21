@@ -307,10 +307,18 @@ sql_ident() {
   printf '"%s"' "$(printf '%s' "$1" | sed 's/"/""/g')"
 }
 
+# db_conninfo <database> - a connection string naming the database, so a name
+# that starts with "-" or contains "=" is not read as an option or as a
+# connection string.
+db_conninfo() {
+  printf "dbname='%s'" "$(printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e "s/'/\\\\'/g")"
+}
+
 # psql_exec <database> <sql> - prints unaligned, tuples-only output. Reads
 # nothing from stdin, so it is safe inside `while read` loops.
 psql_exec() {
-  docker exec -i "${PG_CTR:-$E2E_PG_CTR}" psql -X -q -U postgres -d "$1" -At -v ON_ERROR_STOP=1 -c "$2" </dev/null
+  docker exec -i "${PG_CTR:-$E2E_PG_CTR}" psql -X -q -U postgres -d "$(db_conninfo "$1")" -At -v ON_ERROR_STOP=1 \
+    -c "$2" </dev/null
 }
 
 # When a case ends, run.sh drops the databases on the shared server whose
@@ -347,7 +355,7 @@ drop_db() {
 
 # db_fingerprint <database> - one line per object; see fixtures/fingerprint.sql.
 db_fingerprint() {
-  docker exec -i "${PG_CTR:-$E2E_PG_CTR}" psql -X -q -U postgres -d "$1" -At -v ON_ERROR_STOP=1 -f - \
+  docker exec -i "${PG_CTR:-$E2E_PG_CTR}" psql -X -q -U postgres -d "$(db_conninfo "$1")" -At -v ON_ERROR_STOP=1 -f - \
     <"$E2E_DIR/fixtures/fingerprint.sql"
 }
 

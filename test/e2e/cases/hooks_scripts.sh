@@ -394,7 +394,6 @@ test_hookscripts_inherit_env_keeps_hook_event_and_exit_code() {
   assert_rc 2 "upload to a missing bucket"
   assert_eq "$(hook_events)" "pre-backup backup-error" "hook events"
   _hs_assert_env backup-error POSTGRES_PASSWORD "$PG_PASSWORD"
-  xfail "HOOK_INHERIT_ENV=yes drops HOOK_EVENT and HOOK_EXIT_CODE (set only in the env -i allowlist branch)"
   _hs_assert_env pre-backup HOOK_EVENT pre-backup
   _hs_assert_env backup-error HOOK_EVENT backup-error
   _hs_assert_env backup-error HOOK_EXIT_CODE 2

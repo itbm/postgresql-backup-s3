@@ -344,6 +344,38 @@ test_restore_quoted_database_names() {
   assert_eq "$(bk_tmp_leftovers)" "" "temporary files left in /tmp after restore"
 }
 
+# Names that pg_dump, psql, pg_restore and basename would read as an option or
+# as a connection string if they were passed as they are.
+test_restore_database_names_like_options() {
+  base=$(printf 't_%s' "$CASE_SLUG" | tr '-' '_' | cut -c1-30)
+  src="-d${base}_src=x'y\\z"
+  target="-d${base}_dst=x'y\\z"
+  new_db_named "$src"
+  _record_db "$target"
+  bucket=$(new_bucket) || exit 1
+  _rst_backup plain "$src" "$bucket" -e S3_PREFIX=plain
+  _rst_backup custom "$src" "$bucket" -e S3_PREFIX=custom -e USE_CUSTOM_FORMAT=yes
+  plain_key=$(s3_single_key "$bucket" plain/) || exit 1
+  custom_key=$(s3_single_key "$bucket" custom/) || exit 1
+
+  bk_restore plain "$target" "$bucket" "$plain_key" -e CREATE_DATABASE=yes
+  assert_rc 0 "plain restore into database '$target'"
+  assert_same_data "$src" "$target"
+
+  for jobs in 1 2; do
+    bk_restore "custom-$jobs" "$target" "$bucket" "$custom_key" -e DROP_DATABASE=yes -e CREATE_DATABASE=yes \
+      -e "PARALLEL_JOBS=$jobs"
+    assert_rc 0 "custom restore into database '$target' with PARALLEL_JOBS=$jobs"
+    assert_same_data "$src" "$target"
+  done
+
+  # At the bucket root, the backup's key starts with "-" too.
+  _rst_backup root "$src" "$bucket" -e S3_PREFIX=
+  bk_restore latest "$src" "$bucket" latest -e S3_PREFIX= -e DROP_DATABASE=yes -e CREATE_DATABASE=yes
+  assert_rc 0 "restore of the latest backup of '$src' from the bucket root"
+  assert_same_data "$target" "$src"
+}
+
 # ---------------------------------------------------------------------------
 # Custom format and PARALLEL_JOBS.
 
@@ -559,7 +591,6 @@ test_restore_older_server_version_custom() {
   assert_match "$OLD_KEY" '\.dump$' "custom format key"
   copy="${OLD_DB}_copy"
 
-  xfail "pg_restore 18 sends SET transaction_timeout, which PostgreSQL 16 rejects, so a custom-format restore into PostgreSQL 16 exits 1 although the data is restored"
   bk_restore restore "$copy" "$OLD_BUCKET" "$OLD_KEY" --unset POSTGRES_HOST -e POSTGRES_HOST=rst-old \
     -e CREATE_DATABASE=yes
   assert_rc 0 "custom restore into the PostgreSQL $OLD_VERSION server the backup came from"
@@ -702,6 +733,22 @@ test_restore_extra_opts_reach_psql_and_pg_restore() {
     -e PARALLEL_JOBS=2 -e POSTGRES_PORT=1 -e "POSTGRES_EXTRA_OPTS=-p 5432"
   assert_rc 0 "custom restore with the port from POSTGRES_EXTRA_OPTS"
   assert_log_not_contains "WARNING"
+  assert_same_data "$db" "$target"
+}
+
+# POSTGRES_EXTRA_OPTS goes to every PostgreSQL tool a run uses. A custom-format
+# restore into an existing database runs only pg_restore, so options that only
+# pg_restore accepts work there.
+test_restore_custom_accepts_pg_restore_only_extra_opts() {
+  db=$(new_db) || exit 1
+  bucket=$(new_bucket) || exit 1
+  _rst_backup backup "$db" "$bucket" -e USE_CUSTOM_FORMAT=yes
+  key=$(s3_single_key "$bucket" backup/) || exit 1
+  target="${db}_copy"
+  _rst_empty_db "$target"
+
+  bk_restore restore "$target" "$bucket" "$key" -e "POSTGRES_EXTRA_OPTS=--no-owner --no-privileges"
+  assert_rc 0 "custom restore with pg_restore-only options in POSTGRES_EXTRA_OPTS"
   assert_same_data "$db" "$target"
 }
 

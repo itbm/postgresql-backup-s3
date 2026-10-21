@@ -184,9 +184,11 @@ WARNING: by default this deletes all files in the S3_PREFIX path, not just those
 
 The backup uploaded by the current run is never deleted. A failed delete fails the backup, and the log shows how many files were deleted and kept.
 
+A time in the future, such as `7 days` without `ago`, is rejected before the backup starts, because every file would be older than it.
+
 ### Encryption
 
-You can additionally set the `ENCRYPTION_PASSWORD` environment variable like `-e ENCRYPTION_PASSWORD="superstrongpassword"` to encrypt the backup. New backups use AES-256-CBC with PBKDF2 (100000 iterations). The restore process detects encrypted backups and decrypts them when `ENCRYPTION_PASSWORD` is set; legacy (pre-PBKDF2) backups are still accepted with a warning. Manual decrypt for current backups: `openssl enc -aes-256-cbc -d -pbkdf2 -iter 100000 -in backup.sql.gz.enc -out backup.sql.gz`.
+You can additionally set the `ENCRYPTION_PASSWORD` environment variable like `-e ENCRYPTION_PASSWORD="superstrongpassword"` to encrypt the backup. New backups use AES-256-CBC with PBKDF2 (100000 iterations). The restore process detects encrypted backups and decrypts them when `ENCRYPTION_PASSWORD` is set; legacy (pre-PBKDF2) backups are still accepted with a warning. AES-256-CBC cannot detect a wrong password by itself, so the restore also checks that the decrypted file is a readable backup before it changes the database. Manual decrypt for current backups: `openssl enc -aes-256-cbc -d -pbkdf2 -iter 100000 -in backup.sql.gz.enc -out backup.sql.gz`.
 
 ### Backup verification
 
@@ -226,7 +228,7 @@ $ docker run ... -e PARALLEL_JOBS=4 -e BACKUP_FILE=backup/dbname_0000-00-00T00:0
 
 Note: Custom format is not available when using `POSTGRES_DATABASE=all` as pg_dumpall does not support this format.
 
-Note: Plain backups made by `pg_dump` 17 or later contain `SET transaction_timeout = 0;`, which PostgreSQL 16 and older reject. When restoring into those servers, that line is skipped.
+Note: `pg_dump` and `pg_restore` 17 and later set `transaction_timeout`, which PostgreSQL 16 and older reject. When restoring into those servers, a plain restore skips that line of the backup, and a custom-format restore ignores the errors it causes.
 
 ### Lifecycle hooks
 

@@ -200,6 +200,11 @@ if grep -q 'POSTGRES_PASSWORD=supersecret' "$INHERIT_ENV"; then
 else
   fail "HOOK_INHERIT_ENV=yes should pass POSTGRES_PASSWORD"
 fi
+if grep -q '^HOOK_EVENT=pre-backup$' "$INHERIT_ENV"; then
+  pass
+else
+  fail "HOOK_INHERIT_ENV=yes should pass HOOK_EVENT"
+fi
 HOOK_INHERIT_ENV=no
 
 # Error hook receives HOOK_EXIT_CODE.
@@ -217,6 +222,15 @@ else
   fail "HOOK_EXIT_CODE not passed to error hook"
   cat "$WORKDIR/error.env" >&2
 fi
+HOOK_INHERIT_ENV=yes
+assert_ok hook_run_script backup-error
+if grep -q '^HOOK_EXIT_CODE=7$' "$WORKDIR/error.env" && grep -q '^HOOK_EVENT=backup-error$' "$WORKDIR/error.env"; then
+  pass
+else
+  fail "HOOK_INHERIT_ENV=yes should pass HOOK_EVENT and HOOK_EXIT_CODE to error hooks"
+  cat "$WORKDIR/error.env" >&2
+fi
+HOOK_INHERIT_ENV=no
 
 # Failed error hook does not change run_error_hooks status.
 cat > "$HOOKS_DIR/restore-error" <<EOF
@@ -264,7 +278,7 @@ write_fakes() {
   cat > "$FAKE_BIN/pg_dump" <<'EOF'
 #! /bin/sh
 if [ -n "${FAKE_PGPASS_LOG:-}" ]; then
-  printf 'PGPASSWORD=%s\nARGS=%s\n' "$PGPASSWORD" "$*" > "$FAKE_PGPASS_LOG"
+  printf 'PGPASSWORD=%s\nPGUSER=%s\nARGS=%s\n' "$PGPASSWORD" "$PGUSER" "$*" > "$FAKE_PGPASS_LOG"
 fi
 if [ "${FAKE_DUMP_EMPTY:-no}" = yes ]; then
   exit 0
@@ -284,6 +298,18 @@ case " $* " in
     if [ "${FAKE_RESTORE_LIST_FAIL:-no}" = yes ]; then
       exit 1
     fi
+    exit 0
+    ;;
+esac
+# yes: fails on SET transaction_timeout and carries on; stop: stops there.
+case "${FAKE_RESTORE_TIMEOUT_ERROR:-no}" in
+  yes|stop)
+    echo 'pg_restore: error: could not execute query: ERROR:  unrecognized configuration parameter "transaction_timeout"' >&2
+    echo 'Command was: SET transaction_timeout = 0;' >&2
+    if [ "$FAKE_RESTORE_TIMEOUT_ERROR" = yes ]; then
+      echo 'pg_restore: warning: errors ignored on restore: 1' >&2
+    fi
+    exit 1
     ;;
 esac
 exit 0
@@ -604,6 +630,48 @@ printf '2000-01-01 00:00:00 10 appdb_old.sql.gz\n' > "$WORKDIR/s3-ls.txt"
 assert_ok run_script backup.sh "DELETE_OLDER_THAN=30 days ago"
 assert_eq "$(cat "$WORKDIR/aws-rm.log" 2>/dev/null)" "s3://test-bucket/backup/appdb_old.sql.gz" "retention delete key"
 
+# Retention takes each key as listed, spaces included, and skips only sub-prefix lines.
+reset_logs
+printf '%s\n' \
+  '                           PRE old/' \
+  '2000-01-01 00:00:00         10  lead.sql.gz' \
+  '2000-01-01 00:00:00         10 two  spaces.sql.gz' \
+  '2000-01-01 00:00:00         10 release PRE 1.sql.gz' \
+  '2000-01-01 00:00:00 12345678901 big.sql.gz' > "$WORKDIR/s3-ls.txt"
+assert_ok run_script backup.sh "DELETE_OLDER_THAN=30 days ago"
+assert_eq "$(cat "$WORKDIR/aws-rm.log" 2>/dev/null)" "s3://test-bucket/backup/ lead.sql.gz
+s3://test-bucket/backup/two  spaces.sql.gz
+s3://test-bucket/backup/release PRE 1.sql.gz
+s3://test-bucket/backup/big.sql.gz" "retention delete keys"
+
+# A DELETE_OLDER_THAN in the future would delete every backup, so it is rejected up front.
+reset_logs
+assert_fail run_script backup.sh "DELETE_OLDER_THAN=7 days"
+if [ -f "$WORKDIR/aws.log" ]; then
+  fail "future DELETE_OLDER_THAN still uploaded"
+else
+  pass
+fi
+
+# The user reaches libpq as PGUSER, so spaces inside it are kept and the
+# surrounding ones dropped; host and port stay on the command line.
+reset_logs
+assert_ok run_script backup.sh "POSTGRES_USER= app user " "FAKE_PGPASS_LOG=$WORKDIR/pgpass.log"
+if grep -q '^PGUSER=app user$' "$WORKDIR/pgpass.log" && grep -q '^ARGS=-h db.example -p 5432 ' "$WORKDIR/pgpass.log"; then
+  pass
+else
+  fail "connection settings not passed as expected: $(cat "$WORKDIR/pgpass.log")"
+fi
+
+# The database name reaches pg_dump as a connection string, so it is never read as options.
+reset_logs
+assert_ok run_script backup.sh "POSTGRES_DATABASE=-dother's" "FAKE_PGPASS_LOG=$WORKDIR/pgpass.log"
+if grep -q "^ARGS=.*-d dbname='-dother\\\\'s'\$" "$WORKDIR/pgpass.log"; then
+  pass
+else
+  fail "database name not passed as a connection string: $(cat "$WORKDIR/pgpass.log")"
+fi
+
 # Temporary files are removed after success and failure.
 assert_eq "$(ls "$TMPDIR" | wc -l | tr -d ' ')" "0" "temp dir cleaned"
 
@@ -612,7 +680,7 @@ reset_logs
 mkdir -p "$WORKDIR/s3/test-bucket/backup"
 printf 'SELECT 1;\n' | gzip > "$WORKDIR/s3/test-bucket/backup/appdb.sql.gz"
 assert_ok run_script restore.sh BACKUP_FILE=backup/appdb.sql.gz
-if grep -q 'ON_ERROR_STOP=1 -d appdb' "$WORKDIR/psql.log"; then
+if grep -q "ON_ERROR_STOP=1 -d dbname='appdb'" "$WORKDIR/psql.log"; then
   pass
 else
   fail "restore psql missing ON_ERROR_STOP=1"
@@ -867,7 +935,7 @@ printf 'encpass\n' > "$SECRETS/encpass"
 # *_FILE secrets are loaded, with the trailing newline removed.
 reset_logs
 assert_ok run_script backup.sh POSTGRES_PASSWORD='**None**' "POSTGRES_PASSWORD_FILE=$SECRETS/pgpass" POSTGRES_USER= "POSTGRES_USER_FILE=$SECRETS/pguser" "FAKE_PGPASS_LOG=$WORKDIR/pgpass.log"
-if grep -q '^PGPASSWORD=filepass$' "$WORKDIR/pgpass.log" && grep -q '^ARGS=.* -U fileuser ' "$WORKDIR/pgpass.log"; then
+if grep -q '^PGPASSWORD=filepass$' "$WORKDIR/pgpass.log" && grep -q '^PGUSER=fileuser$' "$WORKDIR/pgpass.log"; then
   pass
 else
   fail "POSTGRES_PASSWORD_FILE/POSTGRES_USER_FILE not used: $(cat "$WORKDIR/pgpass.log")"
@@ -943,6 +1011,42 @@ reset_logs
 printf '2020-01-01 00:00:00         10 otherdb_2025-06-01T12:00:00Z.dump\n' > "$WORKDIR/s3-ls.txt"
 assert_fail run_script restore.sh BACKUP_FILE=latest
 if grep -q 'No backups of appdb found' "$WORKDIR/last.out"; then pass; else fail "missing no-backups message"; fi
+
+# A custom-format restore into PostgreSQL 16 or older succeeds when its only
+# errors come from SET transaction_timeout, and only if pg_restore carried on.
+reset_logs
+mkdir -p "$WORKDIR/s3/test-bucket/backup"
+printf 'custom' > "$WORKDIR/s3/test-bucket/backup/appdb.dump"
+assert_ok run_script restore.sh BACKUP_FILE=backup/appdb.dump FAKE_RESTORE_TIMEOUT_ERROR=yes
+if grep -q 'transaction_timeout' "$WORKDIR/last.out"; then
+  pass
+else
+  fail "pg_restore errors not shown in the log"
+fi
+assert_ok run_script restore.sh BACKUP_FILE=backup/appdb.dump FAKE_RESTORE_TIMEOUT_ERROR=yes PARALLEL_JOBS=2
+assert_fail run_script restore.sh BACKUP_FILE=backup/appdb.dump FAKE_RESTORE_TIMEOUT_ERROR=stop
+# Without DROP_DATABASE or CREATE_DATABASE, a custom-format restore runs no psql,
+# so pg_restore-only options in POSTGRES_EXTRA_OPTS keep working.
+if [ -f "$WORKDIR/psql.log" ]; then
+  fail "custom-format restore ran psql: $(cat "$WORKDIR/psql.log")"
+else
+  pass
+fi
+
+# BACKUP_FILE=latest takes each key as listed, so names with repeated spaces
+# or " PRE " match.
+for latest_db in 'sales  eu' 'release PRE 1'; do
+  reset_logs
+  mkdir -p "$WORKDIR/s3/test-bucket/backup"
+  printf '2020-01-01 00:00:00         10 %s_2025-06-01T12:00:00Z.dump\n' "$latest_db" > "$WORKDIR/s3-ls.txt"
+  printf 'custom' > "$WORKDIR/s3/test-bucket/backup/${latest_db}_2025-06-01T12:00:00Z.dump"
+  assert_ok run_script restore.sh BACKUP_FILE=latest "POSTGRES_DATABASE=$latest_db"
+  if grep -qF "s3 cp s3://test-bucket/backup/${latest_db}_2025-06-01T12:00:00Z.dump " "$WORKDIR/aws.log"; then
+    pass
+  else
+    fail "BACKUP_FILE=latest for database '$latest_db': $(cat "$WORKDIR/aws.log" "$WORKDIR/last.out")"
+  fi
+done
 
 # Upload options are passed to the upload only.
 reset_logs

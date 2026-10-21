@@ -459,7 +459,6 @@ test_encryption_legacy_backup_passing_pbkdf2_padding_restores() {
     || fail "precondition: the PBKDF2 trial decrypt of this fixture should pass the padding check"
   s3_put "$bucket" backup/legacy.sql.gz.enc "$CASE_DIR/legacy.enc"
 
-  xfail "restore.sh only falls back to the legacy key derivation when the PBKDF2 attempt fails, but about 1 legacy backup in 256 passes the CBC padding check with the PBKDF2 key and is restored as garbage"
   bk_restore restore "$target" "$bucket" backup/legacy.sql.gz.enc -e "ENCRYPTION_PASSWORD=$_ENC_PASSWORD" \
     -e CREATE_DATABASE=yes
   assert_rc 0 "restore of a legacy backup"
@@ -497,7 +496,6 @@ test_encryption_wrong_password_passing_pbkdf2_padding_keeps_database() {
     || fail "precondition: the wrong password should pass the PBKDF2 padding check for this fixture"
   s3_put "$bucket" backup/fixture.sql.gz.enc "$CASE_DIR/backup.enc"
 
-  xfail "a wrong password whose PBKDF2 decrypt passes the CBC padding check (about 1 in 256) is not detected, so DROP_DATABASE=yes drops the database before the restore fails"
   bk_restore restore "$db" "$bucket" backup/fixture.sql.gz.enc -e "ENCRYPTION_PASSWORD=$_ENC_WRONG_PASSWORD" \
     -e DROP_DATABASE=yes -e CREATE_DATABASE=yes
   assert_rc 1 "restore with a wrong password"
@@ -517,7 +515,6 @@ test_encryption_wrong_password_passing_legacy_padding_keeps_database() {
     || fail "precondition: the wrong password should pass the legacy padding check for this fixture"
   s3_put "$bucket" backup/fixture.sql.gz.enc "$CASE_DIR/backup.enc"
 
-  xfail "a wrong password whose legacy fallback decrypt passes the CBC padding check (about 1 in 256) is reported as a legacy backup, and DROP_DATABASE=yes drops the database before the restore fails"
   bk_restore restore "$db" "$bucket" backup/fixture.sql.gz.enc -e "ENCRYPTION_PASSWORD=$_ENC_WRONG_PASSWORD" \
     -e DROP_DATABASE=yes -e CREATE_DATABASE=yes
   assert_rc 1 "restore with a wrong password"
