@@ -20,7 +20,7 @@ jobs:
     timeout-minutes: 10
     steps:
       - name: Check out the repo
-        uses: actions/checkout@v5
+        uses: actions/checkout@v7
 
       - name: Run hook unit tests
         run: sh test/hooks_test.sh
@@ -33,7 +33,7 @@ jobs:
       cases: ${{ steps.list.outputs.cases }}
     steps:
       - name: Check out the repo
-        uses: actions/checkout@v5
+        uses: actions/checkout@v7
 
       - name: List case files
         id: list
@@ -53,7 +53,7 @@ jobs:
         cases: ${{ fromJSON(needs.e2e-cases.outputs.cases) }}
     steps:
       - name: Check out the repo
-        uses: actions/checkout@v5
+        uses: actions/checkout@v7
 
       - name: Run end-to-end tests
         env:
