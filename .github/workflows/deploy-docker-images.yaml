@@ -48,8 +48,8 @@ jobs:
         uses: docker/metadata-action@v6
         with:
           images: |
-            lwjerri/postgresql-backup-s3
-            lwjerri/postgres-backup-s3
+            itbm/postgresql-backup-s3
+            itbm/postgres-backup-s3
             ghcr.io/${{ github.repository }}
           tags: |
             type=semver,pattern={{version}}
@@ -70,11 +70,11 @@ jobs:
         with:
           username: ${{ secrets.DOCKER_USERNAME }}
           password: ${{ secrets.DOCKER_PASSWORD }}
-          repository: lwjerri/postgresql-backup-s3
+          repository: itbm/postgresql-backup-s3
 
       - name: Update repo description
         uses: peter-evans/dockerhub-description@v4
         with:
           username: ${{ secrets.DOCKER_USERNAME }}
           password: ${{ secrets.DOCKER_PASSWORD }}
-          repository: lwjerri/postgres-backup-s3
+          repository: itbm/postgres-backup-s3

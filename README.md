@@ -9,13 +9,13 @@ The image is based on Alpine 3.24 and ships the PostgreSQL 18 client (`postgresq
 ### Backup
 
 ```sh
-$ docker run -e S3_ACCESS_KEY_ID=key -e S3_SECRET_ACCESS_KEY=secret -e S3_BUCKET=my-bucket -e S3_PREFIX=backup -e POSTGRES_DATABASE=dbname -e POSTGRES_USER=user -e POSTGRES_PASSWORD=password -e POSTGRES_HOST=localhost lwjerri/postgres-backup-s3
+$ docker run -e S3_ACCESS_KEY_ID=key -e S3_SECRET_ACCESS_KEY=secret -e S3_BUCKET=my-bucket -e S3_PREFIX=backup -e POSTGRES_DATABASE=dbname -e POSTGRES_USER=user -e POSTGRES_PASSWORD=password -e POSTGRES_HOST=localhost itbm/postgres-backup-s3
 ```
 
 ### Restore
 
 ```sh
-$ docker run -e S3_ACCESS_KEY_ID=key -e S3_SECRET_ACCESS_KEY=secret -e S3_BUCKET=my-bucket -e BACKUP_FILE=backup/dbname_0000-00-00T00:00:00Z.sql.gz -e POSTGRES_DATABASE=dbname -e POSTGRES_USER=user -e POSTGRES_PASSWORD=password -e POSTGRES_HOST=localhost -e CREATE_DATABASE=yes lwjerri/postgres-backup-s3
+$ docker run -e S3_ACCESS_KEY_ID=key -e S3_SECRET_ACCESS_KEY=secret -e S3_BUCKET=my-bucket -e BACKUP_FILE=backup/dbname_0000-00-00T00:00:00Z.sql.gz -e POSTGRES_DATABASE=dbname -e POSTGRES_USER=user -e POSTGRES_PASSWORD=password -e POSTGRES_HOST=localhost -e CREATE_DATABASE=yes itbm/postgres-backup-s3
 ```
 
 Note: When `BACKUP_FILE` is provided, the container automatically runs the restore process instead of backup.
@@ -51,7 +51,7 @@ spec:
     spec:
       containers:
       - name: postgresql
-        image: lwjerri/postgresql-backup-s3
+        image: itbm/postgresql-backup-s3
         imagePullPolicy: Always
         env:
         - name: POSTGRES_DATABASE
@@ -140,7 +140,7 @@ AWS CLI v2 does not always use the system trust store. For S3-compatible endpoin
 1. **Mount extra CAs** (preferred): copy or volume-mount PEM files named `*.crt` into `/usr/local/share/ca-certificates/`. On start the container runs `update-ca-certificates` and points AWS CLI at the system bundle.
 
 ```sh
-$ docker run ... -v /path/to/minio.crt:/usr/local/share/ca-certificates/minio.crt:ro lwjerri/postgres-backup-s3
+$ docker run ... -v /path/to/minio.crt:/usr/local/share/ca-certificates/minio.crt:ro itbm/postgres-backup-s3
 ```
 
 Kubernetes ConfigMap example:
@@ -160,7 +160,7 @@ volumes:
 2. **Bundle path**: set `S3_CA_BUNDLE` (or `AWS_CA_BUNDLE`) to a mounted CA file or bundle. `S3_CA_BUNDLE` overrides the auto system path.
 
 ```sh
-$ docker run ... -v /path/to/ca.pem:/certs/ca.pem:ro -e S3_CA_BUNDLE=/certs/ca.pem lwjerri/postgres-backup-s3
+$ docker run ... -v /path/to/ca.pem:/certs/ca.pem:ro -e S3_CA_BUNDLE=/certs/ca.pem itbm/postgres-backup-s3
 ```
 
 3. **Last resort** (insecure): `-e S3_SSL_VERIFY=no` passes `--no-verify-ssl` to every `aws` call (backup upload, restore download, and old-backup deletion).
@@ -214,17 +214,17 @@ There are two options for backup format:
 For plain text format, backups are compressed with `gzip` by default. For improved performance on multi-core systems, you can use `pigz` (parallel gzip) instead:
 
 ```sh
-$ docker run ... -e COMPRESSION_CMD=pigz ... lwjerri/postgres-backup-s3
+$ docker run ... -e COMPRESSION_CMD=pigz ... itbm/postgres-backup-s3
 
-$ docker run ... -e DECOMPRESSION_CMD="pigz -dc" ... lwjerri/postgres-backup-s3
+$ docker run ... -e DECOMPRESSION_CMD="pigz -dc" ... itbm/postgres-backup-s3
 ```
 
 When using custom format with parallel restore:
 
 ```sh
-$ docker run ... -e USE_CUSTOM_FORMAT=yes ... lwjerri/postgres-backup-s3
+$ docker run ... -e USE_CUSTOM_FORMAT=yes ... itbm/postgres-backup-s3
 
-$ docker run ... -e PARALLEL_JOBS=4 -e BACKUP_FILE=backup/dbname_0000-00-00T00:00:00Z.dump ... lwjerri/postgres-backup-s3
+$ docker run ... -e PARALLEL_JOBS=4 -e BACKUP_FILE=backup/dbname_0000-00-00T00:00:00Z.dump ... itbm/postgres-backup-s3
 ```
 
 Note: Custom format is not available when using `POSTGRES_DATABASE=all` as pg_dumpall does not support this format.
@@ -247,7 +247,7 @@ Events (script path is `$HOOKS_DIR/<event>`):
 For each event the container runs the script (if present) and then the URL (if set). Either may be omitted. Heartbeat monitors typically only need the success URL:
 
 ```sh
-$ docker run ... -e HOOK_POST_BACKUP_URL=https://hc-ping.com/<uuid> ... lwjerri/postgres-backup-s3
+$ docker run ... -e HOOK_POST_BACKUP_URL=https://hc-ping.com/<uuid> ... itbm/postgres-backup-s3
 ```
 
 Healthchecks.io start/fail pings:
@@ -257,13 +257,13 @@ $ docker run ... \
   -e HOOK_PRE_BACKUP_URL=https://hc-ping.com/<uuid>/start \
   -e HOOK_POST_BACKUP_URL=https://hc-ping.com/<uuid> \
   -e HOOK_BACKUP_ERROR_URL=https://hc-ping.com/<uuid>/fail \
-  ... lwjerri/postgres-backup-s3
+  ... itbm/postgres-backup-s3
 ```
 
 Mounted script example:
 
 ```sh
-$ docker run ... -v /path/to/post-backup:/hooks/post-backup:ro ... lwjerri/postgres-backup-s3
+$ docker run ... -v /path/to/post-backup:/hooks/post-backup:ro ... itbm/postgres-backup-s3
 ```
 
 The file must be executable. Hook scripts and URL pings run as the unprivileged `hook` user. `/hooks` is owned by root and is not writable by that user.

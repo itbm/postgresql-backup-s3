@@ -1,4 +1,4 @@
-module github.com/LWJerri/postgresql-backup-s3
+module github.com/itbm/postgresql-backup-s3
 
 go 1.22
 
