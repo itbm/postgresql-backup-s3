@@ -135,7 +135,7 @@ fi
 
 echo "Uploading dump to $S3_BUCKET"
 
-aws $AWS_ARGS s3 cp $UPLOAD_ARGS "$SRC_FILE" "$BACKUP_S3_URI" || exit 2
+aws $AWS_ARGS s3 cp $UPLOAD_ARGS "$SRC_FILE" "$BACKUP_S3_URI" $S3_EXTRA_OPTS || exit 2
 rm -f "$SRC_FILE"
 
 if has_value "${DELETE_OLDER_THAN}"; then

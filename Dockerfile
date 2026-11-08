@@ -38,6 +38,7 @@ ENV POSTGRES_DATABASE=**None** \
 	S3_REGION=us-west-1 \
 	S3_PREFIX='backup' \
 	S3_ENDPOINT=**None** \
+	S3_EXTRA_OPTS='' \
 	S3_CA_BUNDLE=**None** \
 	S3_SSL_VERIFY=yes \
 	S3_S3V4=no \

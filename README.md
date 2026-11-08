@@ -101,6 +101,7 @@ An empty value is treated the same as an unset variable.
 | S3_PREFIX            | backup    |          | Path prefix in your bucket. Leading and trailing slashes are ignored; leave empty to store backups at the bucket root      |
 | S3_REGION            | us-west-1 |          | The AWS S3 bucket region                                                                                                 |
 | S3_ENDPOINT          |           |          | The AWS Endpoint URL, for S3 Compliant APIs such as [minio](https://minio.io)                                            |
+| S3_EXTRA_OPTS        |           |          | Extra arguments passed to `aws s3 cp` command                                                                            |
 | S3_CA_BUNDLE         |           |          | Path to a CA file or bundle used for S3 HTTPS (sets `AWS_CA_BUNDLE`)                                                     |
 | S3_SSL_VERIFY        | yes       |          | Set to `no` to disable TLS verification (`aws --no-verify-ssl`). Insecure; prefer a custom CA instead                    |
 | S3_S3V4              | no        |          | Set to `yes` to enable AWS Signature Version 4, required for [minio](https://minio.io) servers                           |

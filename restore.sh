@@ -171,7 +171,7 @@ DOWNLOAD_PATH="$WORK_DIR/$LOCAL_FILE"
 run_hooks pre-restore
 
 echo "Downloading backup file from S3: s3://${S3_BUCKET}/${BACKUP_FILE}"
-aws $AWS_ARGS s3 cp "s3://${S3_BUCKET}/${BACKUP_FILE}" "$DOWNLOAD_PATH" || exit 2
+aws $AWS_ARGS s3 cp "s3://${S3_BUCKET}/${BACKUP_FILE}" "$DOWNLOAD_PATH" $S3_EXTRA_OPTS || exit 2
 
 case "$LOCAL_FILE" in
   *.enc)
