@@ -1,6 +1,8 @@
 # postgres-backup-s3
 
-Backup and restore PostgreSQL to/from S3 (supports periodic backups and encryption)
+Backup and restore PostgreSQL to/from S3 (supports periodic backups and encryption).
+
+The image is based on Alpine 3.24 and ships the PostgreSQL 18 client (`postgresql18-client`), the current stable major release. PostgreSQL 19 is not used yet because it is still in beta.
 
 ## Basic Usage
 
@@ -17,6 +19,10 @@ $ docker run -e S3_ACCESS_KEY_ID=key -e S3_SECRET_ACCESS_KEY=secret -e S3_BUCKET
 ```
 
 Note: When `BACKUP_FILE` is provided, the container automatically runs the restore process instead of backup.
+
+Set `BACKUP_FILE=latest` to restore the newest backup of `POSTGRES_DATABASE` in `S3_PREFIX`. It picks the most recent file named `<POSTGRES_DATABASE>_<timestamp>` with a `.sql.gz`, `.dump` or `.enc` extension, and fails if there is none.
+
+Plain SQL restores of a single database stop at the first SQL error, so a partial restore is reported as a failure. Restoring into a database that already contains the same tables fails for this reason; use `DROP_DATABASE=yes` and `CREATE_DATABASE=yes` to restore into a clean database, or set `RESTORE_ON_ERROR_STOP=no` to keep the old behaviour.
 
 ## Kubernetes Deployment
 
@@ -70,9 +76,15 @@ spec:
           value: ""
         - name: SCHEDULE
           value: ""
+        - name: HOOK_POST_BACKUP_URL
+          value: ""
 ```
 
 ## Environment variables
+
+An empty value is treated the same as an unset variable.
+
+`POSTGRES_USER`, `POSTGRES_PASSWORD`, `S3_ACCESS_KEY_ID`, `S3_SECRET_ACCESS_KEY` and `ENCRYPTION_PASSWORD` can also be read from a file by setting the same name with a `_FILE` suffix, for example `POSTGRES_PASSWORD_FILE=/run/secrets/postgres_password`. This works with Docker and Kubernetes secrets. A trailing newline in the file is ignored. Setting both a variable and its `_FILE` form is an error, and so is an empty file.
 
 | Variable             | Default   | Required | Description                                                                                                              |
 |----------------------|-----------|----------|--------------------------------------------------------------------------------------------------------------------------|
@@ -81,29 +93,87 @@ spec:
 | POSTGRES_PORT        | 5432      |          | The PostgreSQL port                                                                                                      |
 | POSTGRES_USER        |           | Y        | The PostgreSQL user                                                                                                      |
 | POSTGRES_PASSWORD    |           | Y        | The PostgreSQL password                                                                                                  |
-| POSTGRES_EXTRA_OPTS  |           |          | Extra postgresql options                                                                                                 |
-| S3_ACCESS_KEY_ID     |           | Y        | Your AWS access key                                                                                                      |
-| S3_SECRET_ACCESS_KEY |           | Y        | Your AWS secret key                                                                                                      |
+| POSTGRES_EXTRA_OPTS  |           |          | Extra options passed to all PostgreSQL client commands (`pg_dump`, `psql`, `pg_restore`, etc.)                           |
+| POSTGRES_EXTRA_DUMP_OPTS |       |          | Extra options passed only to `pg_dump`/`pg_dumpall` (e.g. `--exclude-table=public.foo`)                                  |
+| S3_ACCESS_KEY_ID     |           |          | AWS access key. Optional when using the default AWS credential chain (IAM role, instance profile, etc.)                  |
+| S3_SECRET_ACCESS_KEY |           |          | AWS secret key. Required if `S3_ACCESS_KEY_ID` is set                                                                    |
 | S3_BUCKET            |           | Y        | Your AWS S3 bucket path                                                                                                  |
-| S3_PREFIX            | backup    |          | Path prefix in your bucket                                                                                               |
+| S3_PREFIX            | backup    |          | Path prefix in your bucket. Leading and trailing slashes are ignored; leave empty to store backups at the bucket root      |
 | S3_REGION            | us-west-1 |          | The AWS S3 bucket region                                                                                                 |
 | S3_ENDPOINT          |           |          | The AWS Endpoint URL, for S3 Compliant APIs such as [minio](https://minio.io)                                            |
 | S3_EXTRA_OPTS        |           |          | Extra arguments passed to `aws s3 cp` command                                                                            |
+| S3_CA_BUNDLE         |           |          | Path to a CA file or bundle used for S3 HTTPS (sets `AWS_CA_BUNDLE`)                                                     |
+| S3_SSL_VERIFY        | yes       |          | Set to `no` to disable TLS verification (`aws --no-verify-ssl`). Insecure; prefer a custom CA instead                    |
 | S3_S3V4              | no        |          | Set to `yes` to enable AWS Signature Version 4, required for [minio](https://minio.io) servers                           |
-| SCHEDULE             |           |          | Backup schedule time, see explainatons below                                                                             |
+| S3_STORAGE_CLASS     |           |          | Storage class for uploaded backups, for example `STANDARD_IA` or `GLACIER_IR`                                              |
+| S3_SSE               |           |          | Server-side encryption for uploaded backups: `AES256`, `aws:kms` or `aws:kms:dsse`                                         |
+| S3_SSE_KMS_KEY_ID    |           |          | KMS key ID or alias for `S3_SSE=aws:kms` or `aws:kms:dsse`                                                               |
+| SCHEDULE             |           |          | Backup schedule, see [Automatic Periodic Backups](#automatic-periodic-backups)                                          |
+| BACKUP_ON_START      | no        |          | With `SCHEDULE`, set to `yes` to run a backup as soon as the container starts, then follow the schedule                  |
+| COMMAND_TIMEOUT      |           |          | Max duration for a scheduled backup (`go` duration, e.g. `2h`). Empty/`0` disables the timeout (default)                 |
+| TZ                   | UTC       |          | Time zone for logs, `SCHEDULE` and `DELETE_OLDER_THAN`, for example `Europe/London`. Backup file names always use UTC     |
 | ENCRYPTION_PASSWORD  |           |          | Password to encrypt/decrypt the backup                                                                                   |
 | DELETE_OLDER_THAN    |           |          | Delete old backups, see explanation and warning below                                                                    |
+| DELETE_MATCH_DATABASE | no       |          | Set to `yes` so `DELETE_OLDER_THAN` only deletes this database's backups, named `<POSTGRES_DATABASE>_<timestamp>`        |
 | USE_CUSTOM_FORMAT    | no        |          | Use PostgreSQL's custom format (-Fc) instead of plain text with compression                                              |
 | COMPRESSION_CMD      | gzip      |          | Command used to compress the backup (e.g. `pigz` for parallel compression) - ignored when USE_CUSTOM_FORMAT=yes          |
 | DECOMPRESSION_CMD    | gunzip -c |          | Command used to decompress the backup (e.g. `pigz -dc` for parallel decompression) - ignored when USE_CUSTOM_FORMAT=yes  |
 | PARALLEL_JOBS        | 1         |          | Number of parallel jobs for pg_restore when using custom format backups                                                  |
-| BACKUP_FILE          |           | Y*       | Required for restore. The path to the backup file in S3, format: S3_PREFIX/filename                                      |
+| BACKUP_FILE          |           | Y*       | Required for restore. The path to the backup file in S3, format: S3_PREFIX/filename, or `latest` for the newest backup    |
 | CREATE_DATABASE      | no        |          | For restore: Set to `yes` to create the database if it doesn't exist                                                     |
-| DROP_DATABASE        | no        |          | For restore: Set to `yes` to drop the database before restoring (caution: destroys existing data). Use with CREATE_DATABASE=yes to recreate it |
+| DROP_DATABASE        | no        |          | For restore: Set to `yes` to drop the database before restoring (caution: destroys existing data). Use with CREATE_DATABASE=yes to recreate it. The restore fails if the drop fails |
+| RESTORE_ON_ERROR_STOP |          |          | For plain SQL restores: `yes` stops at the first SQL error and fails the restore; `no` continues past errors. Defaults to `yes` for a single database and `no` for `POSTGRES_DATABASE=all` |
+| HOOKS_DIR            | /hooks    |          | Directory of optional executable hook scripts named after each event (see Lifecycle hooks) |
+| HOOK_PRE_BACKUP_URL  |           |          | HTTPS URL pinged after backup validation and before the dump (e.g. Healthchecks `/start`) |
+| HOOK_POST_BACKUP_URL |           |          | HTTPS URL pinged after a successful backup (heartbeat / success ping) |
+| HOOK_BACKUP_ERROR_URL |          |          | HTTPS URL pinged if backup fails after validation (e.g. Healthchecks `/fail`) |
+| HOOK_PRE_RESTORE_URL |           |          | HTTPS URL pinged after restore validation and before download |
+| HOOK_POST_RESTORE_URL |          |          | HTTPS URL pinged after a successful restore |
+| HOOK_RESTORE_ERROR_URL |         |          | HTTPS URL pinged if restore fails after validation |
+| HOOK_ALLOW_HTTP      | no        |          | Set to `yes` to allow `http://` hook URLs (HTTPS only by default) |
+| HOOK_INHERIT_ENV     | no        |          | Set to `yes` so script hooks inherit the full container environment (including secrets). Default is a scrubbed allowlist |
+
+### Custom / self-signed S3 CA
+
+AWS CLI v2 does not always use the system trust store. For S3-compatible endpoints that use a private or self-signed certificate, prefer trusting the CA rather than disabling verification.
+
+1. **Mount extra CAs** (preferred): copy or volume-mount PEM files named `*.crt` into `/usr/local/share/ca-certificates/`. On start the container runs `update-ca-certificates` and points AWS CLI at the system bundle.
+
+```sh
+$ docker run ... -v /path/to/minio.crt:/usr/local/share/ca-certificates/minio.crt:ro lwjerri/postgres-backup-s3
+```
+
+Kubernetes ConfigMap example:
+
+```yaml
+volumeMounts:
+  - name: s3-ca
+    mountPath: /usr/local/share/ca-certificates/minio.crt
+    subPath: minio.crt
+    readOnly: true
+volumes:
+  - name: s3-ca
+    configMap:
+      name: s3-ca
+```
+
+2. **Bundle path**: set `S3_CA_BUNDLE` (or `AWS_CA_BUNDLE`) to a mounted CA file or bundle. `S3_CA_BUNDLE` overrides the auto system path.
+
+```sh
+$ docker run ... -v /path/to/ca.pem:/certs/ca.pem:ro -e S3_CA_BUNDLE=/certs/ca.pem lwjerri/postgres-backup-s3
+```
+
+3. **Last resort** (insecure): `-e S3_SSL_VERIFY=no` passes `--no-verify-ssl` to every `aws` call (backup upload, restore download, and old-backup deletion).
 
 ### Automatic Periodic Backups
 
-You can additionally set the `SCHEDULE` environment variable like `-e SCHEDULE="@daily"` to run the backup automatically.
+You can additionally set the `SCHEDULE` environment variable like `-e SCHEDULE="@daily"` to run the backup automatically. Set `-e BACKUP_ON_START=yes` to also take a backup as soon as the container starts.
+
+Schedules use the container's time zone, which is UTC unless you set `TZ`. You can also set a time zone for the schedule alone with a `CRON_TZ=` prefix, for example `-e SCHEDULE="CRON_TZ=Europe/London 0 3 * * *"`.
+
+If a run is still in progress when the next schedule fires, the overlapping run is skipped. Optionally set `COMMAND_TIMEOUT` (for example `-e COMMAND_TIMEOUT=2h`) to limit how long a single scheduled backup may run; by default there is no timeout. When the timeout expires, the backup and all of its child processes (`pg_dump`, `aws` and so on) receive `SIGTERM`, then `SIGKILL` after 30 seconds.
+
+Stopping the container (`docker stop`) terminates a running backup or restore the same way, in scheduled and one-off mode, so temporary files are removed and the `backup-error` or `restore-error` hook runs. The container exits with the backup or restore exit code in one-off mode.
 
 More information about the scheduling can be found [here](http://godoc.org/github.com/robfig/cron#hdr-Predefined_schedules).
 
@@ -111,11 +181,19 @@ More information about the scheduling can be found [here](http://godoc.org/githu
 
 You can additionally set the `DELETE_OLDER_THAN` environment variable like `-e DELETE_OLDER_THAN="30 days ago"` to delete old backups.
 
-WARNING: this will delete all files in the S3_PREFIX path, not just those created by this script.
+WARNING: by default this deletes all files in the S3_PREFIX path, not just those created by this script. Set `-e DELETE_MATCH_DATABASE=yes` to delete only this database's backups: files named `<POSTGRES_DATABASE>_<timestamp>` with a `.sql.gz`, `.dump` or `.enc` extension, as this image names them. This is recommended when several databases or other files share a prefix.
+
+The backup uploaded by the current run is never deleted. A failed delete fails the backup, and the log shows how many files were deleted and kept.
+
+A time in the future, such as `7 days` without `ago`, is rejected before the backup starts, because every file would be older than it.
 
 ### Encryption
 
-You can additionally set the `ENCRYPTION_PASSWORD` environment variable like `-e ENCRYPTION_PASSWORD="superstrongpassword"` to encrypt the backup. The restore process will automatically detect encrypted backups and decrypt them when the `ENCRYPTION_PASSWORD` environment variable is set correctly. It can be manually decrypted using `openssl aes-256-cbc -d -in backup.sql.gz.enc -out backup.sql.gz`.
+You can additionally set the `ENCRYPTION_PASSWORD` environment variable like `-e ENCRYPTION_PASSWORD="superstrongpassword"` to encrypt the backup. New backups use AES-256-CBC with PBKDF2 (100000 iterations). The restore process detects encrypted backups and decrypts them when `ENCRYPTION_PASSWORD` is set; legacy (pre-PBKDF2) backups are still accepted with a warning. AES-256-CBC cannot detect a wrong password by itself, so the restore also checks that the decrypted file is a readable backup before it changes the database. Manual decrypt for current backups: `openssl enc -aes-256-cbc -d -pbkdf2 -iter 100000 -in backup.sql.gz.enc -out backup.sql.gz`.
+
+### Backup verification
+
+Each dump is checked before it is uploaded. An empty dump is rejected. Custom-format dumps must be readable by `pg_restore --list`, and `gzip` or `pigz` output must pass `gzip -t`. Output from other compression commands is not checked. A dump that fails these checks fails the backup and is not uploaded.
 
 ### Backup Format and Compression Options
 
@@ -150,3 +228,59 @@ $ docker run ... -e PARALLEL_JOBS=4 -e BACKUP_FILE=backup/dbname_0000-00-00T00:0
 ```
 
 Note: Custom format is not available when using `POSTGRES_DATABASE=all` as pg_dumpall does not support this format.
+
+Note: `pg_dump` and `pg_restore` 17 and later set `transaction_timeout`, which PostgreSQL 16 and older reject. When restoring into those servers, a plain restore skips that line of the backup, and a custom-format restore ignores the errors it causes.
+
+### Lifecycle hooks
+
+Optional hooks run at backup and restore lifecycle points. They are **not** shell snippets from the environment: a URL is requested with `curl` as an argument list, and custom logic is an executable file you mount. That avoids treating a ConfigMap or chart value as root shell.
+
+Events (script path is `$HOOKS_DIR/<event>`):
+
+- `pre-backup` / `HOOK_PRE_BACKUP_URL` — after validation, before dump
+- `post-backup` / `HOOK_POST_BACKUP_URL` — dump, encrypt, upload, and optional retention delete all succeeded
+- `backup-error` / `HOOK_BACKUP_ERROR_URL` — non-zero exit after backup hooks were armed
+- `pre-restore` / `HOOK_PRE_RESTORE_URL` — after validation, before download
+- `post-restore` / `HOOK_POST_RESTORE_URL` — restore completed
+- `restore-error` / `HOOK_RESTORE_ERROR_URL` — non-zero exit after restore hooks were armed
+
+For each event the container runs the script (if present) and then the URL (if set). Either may be omitted. Heartbeat monitors typically only need the success URL:
+
+```sh
+$ docker run ... -e HOOK_POST_BACKUP_URL=https://hc-ping.com/<uuid> ... lwjerri/postgres-backup-s3
+```
+
+Healthchecks.io start/fail pings:
+
+```sh
+$ docker run ... \
+  -e HOOK_PRE_BACKUP_URL=https://hc-ping.com/<uuid>/start \
+  -e HOOK_POST_BACKUP_URL=https://hc-ping.com/<uuid> \
+  -e HOOK_BACKUP_ERROR_URL=https://hc-ping.com/<uuid>/fail \
+  ... lwjerri/postgres-backup-s3
+```
+
+Mounted script example:
+
+```sh
+$ docker run ... -v /path/to/post-backup:/hooks/post-backup:ro ... lwjerri/postgres-backup-s3
+```
+
+The file must be executable. Hook scripts and URL pings run as the unprivileged `hook` user. `/hooks` is owned by root and is not writable by that user.
+
+By default script hooks receive only an allowlisted environment (`PATH`, `HOME`, `HOOK_EVENT`, `POSTGRES_DATABASE`, `POSTGRES_HOST`, `POSTGRES_PORT`, `POSTGRES_USER`, `S3_BUCKET`, `S3_PREFIX`, `S3_REGION`, `S3_ENDPOINT`, `BACKUP_DEST_FILE`, `BACKUP_S3_URI`, `BACKUP_FILE`, `TZ`, and `HOOK_EXIT_CODE` on error events). Passwords, AWS keys, session tokens, and IRSA/web-identity files are not passed. Set `HOOK_INHERIT_ENV=yes` only if a script must use those credentials.
+
+URL hooks are HTTPS GET requests with no body and no secret headers. URLs are not written to logs (ping tokens are capabilities). Loopback, link-local/IMDS, and `metadata.google.internal` hosts are rejected, credentials in the URL (`user:pass@`) are rejected, and redirects are not followed. HTTP is off unless `HOOK_ALLOW_HTTP=yes`.
+
+`pre-*` and `post-*` hooks fail closed: a hook failure fails the job. Error hooks are best-effort so they cannot hide the original backup or restore exit code. Validation errors (missing `S3_BUCKET`, and similar) occur before hooks are armed and do not fire `*-error` URLs.
+
+Missing env vars and `**None**` leave current behaviour unchanged: no hooks run.
+
+## Testing
+
+```sh
+$ sh test/hooks_test.sh   # unit tests for hook handling, no Docker needed
+$ test/e2e/run.sh         # builds the image and runs it against PostgreSQL 18 and MinIO
+```
+
+The end-to-end tests need only bash and Docker. See [test/e2e/README.md](test/e2e/README.md) for options and how to add a test. Both suites run on every pull request.
